@@ -19,7 +19,9 @@ dotenv_path = Path(__file__).resolve().parent / '.env'
 load_dotenv(dotenv_path=dotenv_path)
 
 # Initialize Flask app
-app = Flask(__name__)
+# The frontend build is served by the catch-all route below. Disable Flask's
+# default /static route so it cannot shadow React's bundled /static assets.
+app = Flask(__name__, static_folder=None)
 
 # ============ CONFIGURATION ============
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(

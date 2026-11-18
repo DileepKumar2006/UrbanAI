@@ -12,6 +12,10 @@ UrbanPulse is a React and Flask civic issue reporting app. It supports pothole a
 
 The frontend can point to another backend with `REACT_APP_API_URL` before starting or building it. Photo capture uses the browser camera picker where supported; otherwise users can choose a local image. Photo uploads are citizen initiated and do not perform automatic monitoring or AI detection.
 
+### GPS location on reports
+
+On the HTTPS deployment (or `localhost`), a reporter can choose **Use current location** in the report form. The browser then asks for location permission and captures one high-accuracy GPS fix; the coordinates and the reporter-entered street or landmark are saved with the report. Location is optional, and no continuous tracking occurs. If permission is denied or the device cannot get a fix, the reporter can still submit with a manually entered location. The browser must support Geolocation and the user must grant permission for GPS capture.
+
 ## Telegram setup
 
 Create a bot with Telegram's BotFather, add it to the target administrator group, and set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` only in the backend environment. Restart the backend. The Settings screen reports whether the values are configured and displays per-event delivery state. A delivery is considered successful only when Telegram's API accepts the message; the app records `sent`, `failed`, or `not_configured`. New report and completion events are deduplicated per report/event. Do not put the bot token in frontend variables.

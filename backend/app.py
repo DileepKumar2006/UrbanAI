@@ -341,13 +341,20 @@ def create_issue():
     if not image_url:
         return jsonify({'success': False, 'error': 'A report photograph is required.'}), 400
     address = data['geotag_address'].strip()
+    try:
+        latitude = float(data.get('latitude') or 0)
+        longitude = float(data.get('longitude') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'GPS coordinates must be valid numbers.'}), 400
+    if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+        return jsonify({'success': False, 'error': 'GPS coordinates are outside the valid range.'}), 400
 
     issue = Issue(
         issue_type=issue_type,
         title=(data.get('category') or 'Pothole report') if issue_type == 'waste' else 'Pothole report',
         description=data['description'],
-        latitude=float(data.get('latitude') or 0),
-        longitude=float(data.get('longitude') or 0),
+        latitude=latitude,
+        longitude=longitude,
         geotag_address=address,
         area_name=data.get('area_name', ''),
         severity=5,

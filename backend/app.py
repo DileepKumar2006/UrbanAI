@@ -253,14 +253,6 @@ def internal_error(error):
 
 # ============ HEALTH CHECK ============
 
-@app.route('/', methods=['GET'])
-def index():
-    return jsonify({
-        'message': 'UrbanAI backend is running',
-        'api_root': '/api/health'
-    })
-
-
 @app.route('/api/health', methods=['GET'])
 def health_check():
     return jsonify({

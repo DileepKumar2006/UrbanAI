@@ -1,0 +1,15 @@
+Flask==2.3.0
+Flask-CORS==4.0.0
+Flask-SQLAlchemy==3.0.0
+Flask-JWT-Extended==4.4.4
+Flask-Mail==0.9.1
+SQLAlchemy==2.0.0
+python-dotenv==1.0.0
+requests==2.31.0
+opencv-python==4.8.0
+numpy==1.24.0
+Pillow==10.0.0
+tweepy==4.14.0
+python-instagram==1.8.0
+gunicorn==21.2.0
+psycopg2-binary==2.9.0

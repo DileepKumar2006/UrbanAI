@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-const API=(process.env.REACT_APP_API_URL||'http://localhost:5000').replace(/\/$/,'');
+const API=(process.env.REACT_APP_API_URL||(process.env.NODE_ENV==='production'?'':'http://localhost:5000')).replace(/\/$/,'');
 const statusLabel=v=>({new_report:'New report',pending:'Pending',in_progress:'Work in progress',completed:'Completed'}[v]||v);
 const img=v=>v?(v.startsWith('http')?v:`${API}${v}`):'';
 const when=v=>v?new Date(v).toLocaleString():'—';

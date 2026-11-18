@@ -1,0 +1,12 @@
+.git
+**/node_modules
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+**/.env
+**/*.db
+frontend/build
+*.docx
+UrbanAI Civic Response Workflow.png
+WhatsApp Image *.jpeg

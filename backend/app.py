@@ -3,7 +3,7 @@ AI Urban Management Platform - Main Flask Application
 Handles citizen pothole and waste reports and their completion history
 """
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, send_file, abort
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager
@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import os
 import requests
 from werkzeug.utils import secure_filename
+from io import BytesIO
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -35,9 +36,6 @@ db = SQLAlchemy(app)
 jwt = JWTManager(app)
 CORS(app)
 
-UPLOAD_DIR = Path(__file__).resolve().parent / 'uploads'
-UPLOAD_DIR.mkdir(exist_ok=True)
-
 def save_uploaded_image(file):
     if not file or not file.filename:
         return ''
@@ -48,7 +46,8 @@ def save_uploaded_image(file):
     if suffix not in {'.jpg', '.jpeg', '.png', '.webp'}:
         raise ValueError('Unsupported image format.')
     filename = f'{datetime.utcnow().strftime("%Y%m%d%H%M%S%f")}-{filename}'
-    file.save(UPLOAD_DIR / filename)
+    content = file.read()
+    db.session.add(UploadedImage(filename=filename, content=content, mimetype=file.mimetype))
     return f'/api/uploads/{filename}'
 
 def require_admin():
@@ -231,6 +230,13 @@ class TelegramDelivery(db.Model):
     sent_at = db.Column(db.DateTime)
     __table_args__ = (db.UniqueConstraint('issue_id', 'event', name='uq_telegram_issue_event'),)
 
+class UploadedImage(db.Model):
+    __tablename__ = 'uploaded_images'
+    filename = db.Column(db.String(255), primary_key=True)
+    content = db.Column(db.LargeBinary, nullable=False)
+    mimetype = db.Column(db.String(80), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 
 # ============ ERROR HANDLERS ============
 
@@ -314,7 +320,13 @@ def get_issues():
 
 @app.route('/api/uploads/<path:filename>')
 def uploaded_image(filename):
-    return send_from_directory(UPLOAD_DIR, filename)
+    image = db.session.get(UploadedImage, filename)
+    if image:
+        return send_file(BytesIO(image.content), mimetype=image.mimetype, download_name=filename)
+    legacy_dir = Path(__file__).resolve().parent / 'uploads'
+    if legacy_dir.exists() and (legacy_dir / filename).is_file():
+        return send_from_directory(legacy_dir, filename)
+    return jsonify({'error': 'Image not found'}), 404
 
 
 @app.route('/api/issues', methods=['POST'])
@@ -488,6 +500,19 @@ def seed_db():
     db.session.add_all([admin, pothole_manager, waste_manager, citizen])
     db.session.commit()
     print("Database seeded with sample users!")
+
+FRONTEND_BUILD = Path(__file__).resolve().parent.parent / 'frontend' / 'build'
+
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def frontend_app(path):
+    if path.startswith('api/'):
+        abort(404)
+    if not FRONTEND_BUILD.exists():
+        return jsonify({'message': 'UrbanPulse backend is running', 'api_root': '/api/health'})
+    if path and (FRONTEND_BUILD / path).is_file():
+        return send_from_directory(FRONTEND_BUILD, path)
+    return send_from_directory(FRONTEND_BUILD, 'index.html')
 
 
 if __name__ == '__main__':

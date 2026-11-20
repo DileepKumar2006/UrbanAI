@@ -1,0 +1,7 @@
+-r requirements.txt
+# Optional model training and inference dependencies. Install only when using
+# the local AI pipeline; these are intentionally excluded from web deployment.
+torch>=2.2,<3
+torchvision>=0.17,<1
+scikit-learn>=1.4,<2
+numpy>=1.26,<3

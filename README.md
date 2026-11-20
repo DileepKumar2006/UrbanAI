@@ -1,6 +1,6 @@
 # UrbanPulse
 
-UrbanPulse is a React and Flask civic issue reporting app. It supports pothole and waste photo reports, persistent report history, department status updates, before and after completion photos, and email notifications through Resend.
+UrbanPulse is a React and Flask civic issue reporting app. It supports civic image reports, persistent report history, department status updates, before and after completion photos, email notifications through Resend, and optional AI category suggestions. AI suggestions do not override citizen confirmation or manually assigned departments.
 
 ## Run locally
 
@@ -11,7 +11,17 @@ UrbanPulse is a React and Flask civic issue reporting app. It supports pothole a
 5. In another terminal, run `npm install` and `npm start` from `frontend` (port 3000).
 6. Create or sign in to an account in Settings. Citizens can view their own reports; administrators and department officers use their account roles for authorized actions. The legacy `URBANPULSE_ADMIN_KEY` remains available for existing administrators.
 
-The frontend can point to another backend with `REACT_APP_API_URL` before starting or building it. Photo capture uses the browser camera picker where supported; otherwise users can choose a local image. Photo uploads are citizen initiated and do not perform automatic monitoring or AI detection.
+The frontend can point to another backend with `REACT_APP_API_URL` before starting or building it. Photo capture uses the browser camera picker where supported; otherwise users can choose a local image. Photo uploads are citizen initiated and do not perform automatic monitoring.
+
+### AI image classification (optional)
+
+The complaint form requests an advisory prediction after a photo is selected. It shows confidence, model version, and review state; the user still selects the confirmed category, and AI downtime never blocks reporting. The backend signs predictions against the image hash, stores predictions separately from the confirmed complaint category, and exposes an administrator review queue. The confirmed category produces a recommended department hint; it does not automatically assign the complaint. Existing administrator/department assignment behavior remains manual because this branch does not contain the Phase 2 workload-routing engine.
+
+The current repository contains a MobileNetV3-Small transfer-learning pipeline, but no trained UrbanAI weights or evaluation metrics. Install `backend/requirements-ai.txt` for optional local ML dependencies. Follow [the dataset preparation guide](backend/ai/dataset/README.md), gather reviewed/licensed labeled examples for each of the seven categories, prepare deterministic splits, then train with `python -m ai.train --data artifacts/dataset-splits --output ai/models` from `backend`. Actual evaluation metrics are saved to `backend/ai/models/evaluation.json`; model weights are git-ignored. Do not use supplied reference photos as a training dataset without explicit permission and proper labels.
+
+The classification endpoint is `POST /api/ai/classify` with multipart field `image`. Reports are created with `POST /api/issues` and may include the signed `prediction_token`; `PATCH /api/issues/<id>/category` records a report-owner/admin correction; administrators list uncertain analyses at `GET /api/admin/ai-review` and review at `PATCH /api/issues/<id>/ai-review` with `confirmed_category`.
+
+Apply the additive Phase 3 schema with `flask --app app db upgrade` from `backend` after backing up and testing a restored copy of an existing production database. It adds `issues.confirmed_category` and `ai_analyses`; it does not delete complaint records. Do not deploy this migration until a database backup and restore have been verified.
 
 ### Database migrations and safe upgrades
 

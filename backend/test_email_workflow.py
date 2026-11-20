@@ -24,14 +24,15 @@ os.environ.update({
     'APP_BASE_URL': 'https://urbanpulse.example',
 })
 
-from app import app, db, EmailDelivery, Issue, UploadedImage, User
+from app import app, db, EmailDelivery, Issue, UploadedImage, User, limiter
 from werkzeug.security import generate_password_hash
 
 
 class ComplaintEmailWorkflowTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        app.config.update(TESTING=True, SQLALCHEMY_DATABASE_URI='sqlite://')
+        app.config.update(TESTING=True, SQLALCHEMY_DATABASE_URI='sqlite://', RATELIMIT_ENABLED=False)
+        limiter.enabled = False
         cls._secret = b'resend-webhook-test-secret'
         os.environ['RESEND_WEBHOOK_SECRET'] = 'whsec_' + base64.b64encode(cls._secret).decode()
 

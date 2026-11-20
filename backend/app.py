@@ -24,6 +24,8 @@ from sqlalchemy import Index, or_, text
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
 from PIL import Image, UnidentifiedImageError
+from ai.categories import COMPLAINT_CATEGORIES, LABELS, LEGACY_WASTE_CATEGORIES, issue_type_for_category, recommended_department
+from ai.inference import ModelUnavailable, classify_image
 
 dotenv_path = Path(__file__).resolve().parent / '.env'
 load_dotenv(dotenv_path=dotenv_path)
@@ -67,16 +69,15 @@ limiter = Limiter(
 configured_origins = [origin.strip() for origin in os.getenv('CORS_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000').split(',') if origin.strip()]
 CORS(app, resources={r"/api/*": {"origins": configured_origins}})
 
-def save_uploaded_image(file):
+def validate_image_upload(file):
     if not file or not file.filename:
-        return ''
+        raise ValueError('An image file is required.')
     if file.mimetype not in {'image/jpeg', 'image/png', 'image/webp'}:
         raise ValueError('Please upload a JPEG, PNG, or WebP image.')
     filename = secure_filename(file.filename)
     suffix = Path(filename).suffix.lower()
     if suffix not in {'.jpg', '.jpeg', '.png', '.webp'}:
         raise ValueError('Unsupported image format.')
-    filename = f'{datetime.utcnow().strftime("%Y%m%d%H%M%S%f")}-{filename}'
     content = file.read()
     try:
         with Image.open(BytesIO(content)) as image:
@@ -94,7 +95,15 @@ def save_uploaded_image(file):
         raise ValueError('Image contents do not match the selected file type.')
     if not content:
         raise ValueError('The uploaded image is empty.')
-    db.session.add(UploadedImage(filename=filename, content=content, mimetype=file.mimetype))
+    return content, file.mimetype, filename
+
+
+def save_uploaded_image(file):
+    if not file or not file.filename:
+        return ''
+    content, mimetype, original_name = validate_image_upload(file)
+    filename = f'{datetime.utcnow().strftime("%Y%m%d%H%M%S%f")}-{original_name}'
+    db.session.add(UploadedImage(filename=filename, content=content, mimetype=mimetype))
     return f'/api/uploads/{filename}'
 
 
@@ -171,9 +180,28 @@ def image_token(issue, image_url):
     return f'{image_url}?access={token}'
 
 
+def analysis_dict(analysis):
+    if not analysis:
+        return None
+    return {
+        'predicted_category': analysis.predicted_category,
+        'confidence_score': analysis.confidence_score,
+        'confirmed_category': analysis.confirmed_category,
+        'reviewed_category': analysis.reviewed_category,
+        'model_version': analysis.model_version,
+        'processing_status': analysis.processing_status,
+        'review_required': analysis.review_required,
+        'error_message': analysis.error_message,
+        'reviewed_at': analysis.reviewed_at.isoformat() if analysis.reviewed_at else None,
+    }
+
+
 def issue_dict_for_request(issue):
     """Return private details only to an admin, owner, or assigned officer."""
     payload = issue.to_dict()
+    payload['recommended_department'] = recommended_department(issue.confirmed_category)
+    latest_analysis = issue.ai_analyses[-1] if issue.ai_analyses else None
+    payload['ai_analysis'] = analysis_dict(latest_analysis)
     user = current_user()
     authorized = require_admin() or can_access_issue(issue, user)
     if authorized:
@@ -192,6 +220,7 @@ def issue_dict_for_request(issue):
         payload.pop('escalation_status', None)
         payload.pop('social_media_posted', None)
         payload.pop('social_media_url', None)
+        payload.pop('ai_analysis', None)
         payload.pop('image_url', None)
         payload.pop('completion_image_url', None)
         payload['area_name'] = issue.area_name or 'Location withheld'
@@ -223,6 +252,7 @@ class Issue(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     issue_type = db.Column(db.String(50), nullable=False)  # pothole, waste
     title = db.Column(db.String(200), nullable=False)
+    confirmed_category = db.Column(db.String(100))
     description = db.Column(db.Text)
     
     # Location data
@@ -261,6 +291,8 @@ class Issue(db.Model):
     creator = db.relationship('User', foreign_keys=[created_by], backref='created_issues')
     escalations = db.relationship('EscalationLog', backref='issue', lazy=True, cascade='all, delete-orphan')
     updates = db.relationship('IssueUpdate', backref='issue', lazy=True, cascade='all, delete-orphan')
+    ai_analyses = db.relationship('AIAnalysis', back_populates='issue', lazy=True,
+                                  order_by='AIAnalysis.created_at', cascade='all, delete-orphan')
     __table_args__ = (
         Index('ix_issues_status_created_at', 'status', 'created_at'),
         Index('ix_issues_type_status', 'issue_type', 'status'),
@@ -274,7 +306,8 @@ class Issue(db.Model):
             'issue_type': self.issue_type,
             'title': self.title,
             'description': self.description,
-            'category': self.title if self.issue_type == 'waste' else None,
+            'category': self.confirmed_category or (self.title if self.issue_type in {'waste', 'civic'} else 'Pothole / Road Damage'),
+            'confirmed_category': self.confirmed_category,
             'latitude': self.latitude,
             'longitude': self.longitude,
             'geotag_address': self.geotag_address,
@@ -390,6 +423,27 @@ class RevokedToken(db.Model):
     revoked_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 
+class AIAnalysis(db.Model):
+    __tablename__ = 'ai_analyses'
+    id = db.Column(db.Integer, primary_key=True)
+    issue_id = db.Column(db.Integer, db.ForeignKey('issues.id'), nullable=False, index=True)
+    image_url = db.Column(db.String(255), nullable=False)
+    image_sha256 = db.Column(db.String(64), nullable=False)
+    predicted_category = db.Column(db.String(100))
+    confidence_score = db.Column(db.Float)
+    confirmed_category = db.Column(db.String(100))
+    reviewed_category = db.Column(db.String(100))
+    model_version = db.Column(db.String(120))
+    processing_status = db.Column(db.String(30), nullable=False, default='pending')
+    review_required = db.Column(db.Boolean, nullable=False, default=False)
+    error_message = db.Column(db.String(500))
+    reviewed_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    reviewed_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    issue = db.relationship('Issue', back_populates='ai_analyses')
+    reviewer = db.relationship('User', foreign_keys=[reviewed_by])
+
+
 class AuditLog(db.Model):
     __tablename__ = 'audit_logs'
     id = db.Column(db.Integer, primary_key=True)
@@ -422,7 +476,7 @@ def build_email_payload(issue, event, recipient):
     label = EMAIL_EVENT_LABELS[event]
     report_id = f'UP-{issue.id:04d}'
     location = issue.geotag_address or 'Not provided'
-    category = issue.title if issue.issue_type == 'waste' else 'Pothole'
+    category = issue.confirmed_category or issue.title
     status_label = issue.status.replace('_', ' ').title()
     submitted = issue.created_at.isoformat() if issue.created_at else 'Unknown'
     completed = issue.completed_at.isoformat() if issue.completed_at else ''
@@ -725,6 +779,45 @@ def get_issues():
     issues = query.order_by(Issue.created_at.desc()).all()
     return jsonify({'success': True, 'items': [issue_dict_for_request(issue) for issue in issues]})
 
+
+@app.route('/api/ai/classify', methods=['POST'])
+@limiter.limit('30 per hour')
+def classify_complaint_image():
+    uploaded = request.files.get('image')
+    if not uploaded or not uploaded.filename:
+        return jsonify({'success': False, 'available': False, 'processing_status': 'failed',
+                        'error': 'Choose a complaint image to classify.'}), 400
+    try:
+        image_bytes, _mimetype, _filename = validate_image_upload(uploaded)
+    except ValueError as error:
+        return jsonify({'success': False, 'available': False, 'processing_status': 'failed',
+                        'error': str(error)}), 400
+    try:
+        result = classify_image(image_bytes)
+    except ModelUnavailable as error:
+        return jsonify({'success': False, 'available': False, 'processing_status': 'unavailable',
+                        'error': str(error)}), 503
+    except (ValueError, RuntimeError) as error:
+        return jsonify({'success': False, 'available': False, 'processing_status': 'failed',
+                        'error': str(error)}), 503
+    if result.get('predicted_category') not in LABELS:
+        return jsonify({'success': False, 'available': False, 'processing_status': 'failed',
+                        'error': 'The model returned a category outside the configured label set.'}), 503
+    confidence = result.get('confidence_score')
+    if not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+        return jsonify({'success': False, 'available': False, 'processing_status': 'failed',
+                        'error': 'The model returned an invalid confidence score.'}), 503
+    signed_claims = {
+        'image_sha256': hashlib.sha256(image_bytes).hexdigest(),
+        'predicted_category': result['predicted_category'],
+        'confidence_score': float(confidence),
+        'model_version': str(result.get('model_version') or 'unknown')[:120],
+        'processing_status': result.get('processing_status') if result.get('processing_status') in {'completed', 'requires_review'} else 'requires_review',
+        'review_required': bool(result.get('review_required', True)),
+    }
+    token = URLSafeTimedSerializer(app.config['JWT_SECRET_KEY'], salt='urbanai-ai-prediction').dumps(signed_claims)
+    return jsonify({'success': True, 'available': True, **signed_claims, 'prediction_token': token}), 200
+
 @app.route('/api/uploads/<path:filename>')
 def uploaded_image(filename):
     safe_filename = secure_filename(filename)
@@ -767,17 +860,24 @@ def create_issue():
         return jsonify({'success': False, 'error': f'Missing fields: {", ".join(missing)}'}), 400
 
     issue_type = data['issue_type']
-    if issue_type not in {'pothole', 'waste'}:
-        return jsonify({'success': False, 'error': 'Only pothole and waste reports are supported.'}), 400
+    if issue_type not in {'pothole', 'waste', 'civic'}:
+        return jsonify({'success': False, 'error': 'Choose a supported civic complaint type.'}), 400
     description = data.get('description')
     address = data.get('geotag_address')
     if not isinstance(description, str) or not description.strip() or len(description) > 5000:
         return jsonify({'success': False, 'error': 'Description must contain 1 to 5,000 characters.'}), 400
     if not isinstance(address, str) or not address.strip() or len(address.strip()) > 255:
         return jsonify({'success': False, 'error': 'Location must contain 1 to 255 characters.'}), 400
-    category = str(data.get('category') or 'Pothole report').strip()
-    if issue_type == 'waste' and (not category or len(category) > 200):
-        return jsonify({'success': False, 'error': 'Waste category must contain 1 to 200 characters.'}), 400
+    category = str(data.get('category') or '').strip()
+    # Keep old clients compatible: the legacy pothole form submitted the waste
+    # selector's first value. Do not reinterpret that as a waste complaint.
+    if issue_type == 'pothole' and (category not in COMPLAINT_CATEGORIES or category in LEGACY_WASTE_CATEGORIES):
+        category = 'Pothole / Road Damage'
+    elif not category:
+        category = 'Pothole / Road Damage' if issue_type == 'pothole' else ''
+    if category not in COMPLAINT_CATEGORIES:
+        return jsonify({'success': False, 'error': 'Choose a valid complaint category.'}), 400
+    issue_type = issue_type_for_category(category)
     try:
         image_url = save_uploaded_image(request.files.get('image')) if request.files else accept_existing_image_url(data.get('image_url'))
     except ValueError as error:
@@ -794,9 +894,11 @@ def create_issue():
         return jsonify({'success': False, 'error': 'GPS coordinates are outside the valid range.'}), 400
 
     user = current_user()
+    confirmed_category = category
     issue = Issue(
         issue_type=issue_type,
-        title=category if issue_type == 'waste' else 'Pothole report',
+        title=category,
+        confirmed_category=confirmed_category,
         description=description.strip(),
         latitude=latitude,
         longitude=longitude,
@@ -809,12 +911,106 @@ def create_issue():
     )
     db.session.add(issue)
     db.session.commit()
+    image_filename = image_url.removeprefix('/api/uploads/') if image_url else ''
+    stored_image = db.session.get(UploadedImage, image_filename) if image_filename else None
+    image_bytes = stored_image.content if stored_image else b''
+    prediction_token = data.get('prediction_token')
+    claims = None
+    if prediction_token:
+        try:
+            claims = URLSafeTimedSerializer(app.config['JWT_SECRET_KEY'], salt='urbanai-ai-prediction').loads(prediction_token, max_age=900)
+            if (not image_bytes or claims.get('image_sha256') != hashlib.sha256(image_bytes).hexdigest()
+                    or claims.get('predicted_category') not in LABELS
+                    or not isinstance(claims.get('confidence_score'), (int, float))
+                    or not 0 <= claims['confidence_score'] <= 1):
+                claims = None
+        except (BadSignature, SignatureExpired, TypeError, ValueError):
+            claims = None
+    if claims:
+        analysis = AIAnalysis(
+            issue_id=issue.id, image_url=image_url,
+            image_sha256=hashlib.sha256(image_bytes).hexdigest(),
+            predicted_category=claims['predicted_category'],
+            confidence_score=float(claims['confidence_score']),
+            confirmed_category=confirmed_category,
+            model_version=claims.get('model_version'),
+            processing_status=claims.get('processing_status', 'requires_review'),
+            review_required=bool(claims.get('review_required')),
+        )
+    else:
+        analysis = AIAnalysis(
+            issue_id=issue.id, image_url=image_url,
+            image_sha256=hashlib.sha256(image_bytes).hexdigest() if image_bytes else '0' * 64,
+            confirmed_category=confirmed_category,
+            processing_status='unavailable' if not prediction_token else 'failed',
+            review_required=bool(prediction_token),
+            error_message=('No valid signed prediction was attached.' if prediction_token else 'AI classification was unavailable; category was selected manually.'),
+        )
+    db.session.add(analysis)
+    db.session.commit()
     audit_action(issue.id, 'complaint_submitted', issue.issue_type)
     db.session.commit()
     notify_issue_by_email(issue, 'created')
     db.session.commit()
     email_statuses = [row.status for row in EmailDelivery.query.filter_by(issue_id=issue.id, email_type='created').all()]
     return jsonify({'success': True, 'issue': issue_dict_for_request(issue), 'email_statuses': email_statuses}), 201
+
+
+@app.route('/api/admin/ai-review', methods=['GET'])
+def get_ai_review_queue():
+    if not require_admin():
+        return jsonify({'success': False, 'error': 'Administrator authorization required.'}), 403
+    analyses = AIAnalysis.query.filter(
+        or_(AIAnalysis.review_required.is_(True), AIAnalysis.processing_status.in_(['failed', 'unavailable']))
+    ).order_by(AIAnalysis.created_at.desc()).limit(200).all()
+    return jsonify({'success': True, 'items': [issue_dict_for_request(row.issue) for row in analyses if row.issue]})
+
+
+@app.route('/api/issues/<int:issue_id>/category', methods=['PATCH'])
+def correct_issue_category(issue_id):
+    issue = Issue.query.get_or_404(issue_id)
+    user = current_user()
+    if not (require_admin() or (user and can_access_issue(issue, user) and user.role == 'citizen' and issue.created_by == user.id)):
+        return jsonify({'success': False, 'error': 'Only the report owner or an administrator can confirm its category.'}), 403
+    category = (request.get_json() or {}).get('category')
+    if category not in COMPLAINT_CATEGORIES:
+        return jsonify({'success': False, 'error': 'Choose a valid complaint category.'}), 400
+    previous = issue.confirmed_category
+    issue.confirmed_category = category
+    issue.title = category
+    issue.issue_type = issue_type_for_category(category)
+    analysis = AIAnalysis.query.filter_by(issue_id=issue.id).order_by(AIAnalysis.created_at.desc()).first()
+    if analysis:
+        analysis.confirmed_category = category
+    audit_action(issue.id, 'category_confirmed', f'{previous or "unset"} -> {category}')
+    db.session.commit()
+    return jsonify({'success': True, 'issue': issue_dict_for_request(issue)})
+
+
+@app.route('/api/issues/<int:issue_id>/ai-review', methods=['PATCH'])
+def review_issue_classification(issue_id):
+    if not require_admin():
+        return jsonify({'success': False, 'error': 'Administrator authorization required.'}), 403
+    issue = Issue.query.get_or_404(issue_id)
+    category = (request.get_json() or {}).get('confirmed_category')
+    if category not in COMPLAINT_CATEGORIES:
+        return jsonify({'success': False, 'error': 'Choose a valid complaint category.'}), 400
+    analysis = AIAnalysis.query.filter_by(issue_id=issue.id).order_by(AIAnalysis.created_at.desc()).first()
+    if not analysis:
+        return jsonify({'success': False, 'error': 'No AI analysis is recorded for this complaint.'}), 404
+    previous = issue.confirmed_category
+    issue.confirmed_category = category
+    issue.title = category
+    issue.issue_type = issue_type_for_category(category)
+    analysis.confirmed_category = category
+    analysis.reviewed_category = category
+    analysis.processing_status = 'reviewed'
+    analysis.review_required = False
+    analysis.reviewed_by = current_user().id if current_user() else None
+    analysis.reviewed_at = datetime.utcnow()
+    audit_action(issue.id, 'ai_classification_reviewed', f'{previous or "unset"} -> {category}; prediction retained: {analysis.predicted_category or "none"}')
+    db.session.commit()
+    return jsonify({'success': True, 'issue': issue_dict_for_request(issue)})
 
 
 @app.route('/api/issues/<int:issue_id>/complete', methods=['POST'])

@@ -12,4 +12,6 @@ node_modules/
 frontend/build/
 backend/instance/
 backend/uploads/
+backend/ai/models/*.pt
+backend/ai/models/*.pth
 *.db

@@ -62,28 +62,6 @@ def require_admin():
     expected = os.getenv('URBANPULSE_ADMIN_KEY', '')
     return bool(expected) and request.headers.get('X-Admin-Key', '') == expected
 
-def send_telegram(issue, event):
-    token, chat_id = os.getenv('TELEGRAM_BOT_TOKEN'), os.getenv('TELEGRAM_CHAT_ID')
-    entry = TelegramDelivery.query.filter_by(issue_id=issue.id, event=event).first()
-    if entry:
-        return
-    entry = TelegramDelivery(issue_id=issue.id, event=event, status='not_configured' if not token or not chat_id else 'pending')
-    db.session.add(entry)
-    db.session.flush()
-    if token and chat_id:
-        label = 'WORK COMPLETED' if event == 'completed' else ('NEW WASTE REPORT' if issue.issue_type == 'waste' else 'NEW POTHOLE REPORT')
-        text = f"🚧 URBANPULSE — {label}\n\n{issue.title}\nLocation: {issue.geotag_address or 'Not provided'}\nReport ID: UP-{issue.id:04d}\nDate: {issue.created_at.isoformat()}\nStatus: {issue.status.replace('_', ' ').title()}"
-        try:
-            response = requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': text}, timeout=8)
-            response.raise_for_status()
-            if not response.json().get('ok'):
-                raise requests.RequestException('Telegram API rejected the message.')
-            entry.status = 'sent'
-            entry.sent_at = datetime.utcnow()
-        except requests.RequestException as error:
-            entry.status = 'failed'
-            entry.error = str(error)[:500]
-
 # ============ DATABASE MODELS ============
 
 class User(db.Model):
@@ -228,17 +206,6 @@ class NotificationQueue(db.Model):
     escalation_triggered = db.Column(db.Boolean, default=False)
     
     recipient = db.relationship('User', backref='notifications')
-
-class TelegramDelivery(db.Model):
-    __tablename__ = 'telegram_deliveries'
-    id = db.Column(db.Integer, primary_key=True)
-    issue_id = db.Column(db.Integer, db.ForeignKey('issues.id'), nullable=False)
-    event = db.Column(db.String(40), nullable=False)
-    status = db.Column(db.String(30), nullable=False)
-    error = db.Column(db.String(500))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    sent_at = db.Column(db.DateTime)
-    __table_args__ = (db.UniqueConstraint('issue_id', 'event', name='uq_telegram_issue_event'),)
 
 class UploadedImage(db.Model):
     __tablename__ = 'uploaded_images'
@@ -575,7 +542,6 @@ def create_issue():
     db.session.add(issue)
     db.session.commit()
     notify_issue_by_email(issue, 'created')
-    send_telegram(issue, 'created')
     db.session.commit()
     email_statuses = [row.status for row in EmailDelivery.query.filter_by(issue_id=issue.id, email_type='created').all()]
     return jsonify({'success': True, 'issue': issue.to_dict(), 'email_statuses': email_statuses}), 201
@@ -607,7 +573,6 @@ def complete_issue(issue_id):
     ))
     db.session.commit()
     notify_issue_by_email(issue, 'completed')
-    send_telegram(issue, 'completed')
     db.session.commit()
     return jsonify({'success': True, 'issue': issue.to_dict()})
 
@@ -737,13 +702,6 @@ def resend_webhook():
         delivery.error = str(data.get('reason') or data.get('bounce', {}).get('message') or event.get('type'))[:1000]
     db.session.commit()
     return jsonify({'success': True}), 200
-
-@app.route('/api/telegram/status')
-def telegram_status():
-    configured = bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID'))
-    rows = TelegramDelivery.query.order_by(TelegramDelivery.created_at.desc()).limit(30).all()
-    return jsonify({'configured': configured, 'deliveries': [{'issue_id': row.issue_id, 'event': row.event, 'status': row.status, 'created_at': row.created_at.isoformat(), 'sent_at': row.sent_at.isoformat() if row.sent_at else None, 'error': row.error} for row in rows]})
-
 
 @app.route('/api/issues/<int:issue_id>/escalate', methods=['POST'])
 def escalate_issue(issue_id):

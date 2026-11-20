@@ -10,10 +10,16 @@ from flask_jwt_extended import JWTManager
 from datetime import datetime, timedelta
 import os
 import requests
+import base64
+import hashlib
+import hmac
+import html
+import json
 from werkzeug.utils import secure_filename
 from io import BytesIO
 from pathlib import Path
 from dotenv import load_dotenv
+from sqlalchemy import inspect, text
 
 dotenv_path = Path(__file__).resolve().parent / '.env'
 load_dotenv(dotenv_path=dotenv_path)
@@ -123,6 +129,7 @@ class Issue(db.Model):
     # Assignment
     assigned_to = db.Column(db.Integer, db.ForeignKey('users.id'))
     assigned_at = db.Column(db.DateTime)
+    assigned_department = db.Column(db.String(120))
     
     # Escalation
     escalation_level = db.Column(db.Integer, default=0)  # 0-5
@@ -157,6 +164,7 @@ class Issue(db.Model):
             'image_url': self.image_url,
             'completion_image_url': self.completion_image_url,
             'assigned_to': self.assigned_to,
+            'assigned_department': self.assigned_department,
             'escalation_level': self.escalation_level,
             'escalation_status': self.escalation_status,
             'social_media_posted': self.social_media_posted,
@@ -239,6 +247,205 @@ class UploadedImage(db.Model):
     mimetype = db.Column(db.String(80), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+class EmailDelivery(db.Model):
+    __tablename__ = 'email_deliveries'
+    id = db.Column(db.Integer, primary_key=True)
+    issue_id = db.Column(db.Integer, db.ForeignKey('issues.id'), nullable=False)
+    recipient_email = db.Column(db.String(320), nullable=False)
+    email_type = db.Column(db.String(40), nullable=False)
+    status = db.Column(db.String(30), nullable=False, default='pending')
+    provider_email_id = db.Column(db.String(120))
+    idempotency_key = db.Column(db.String(64), nullable=False)
+    attempt_count = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    last_attempt_at = db.Column(db.DateTime)
+    accepted_at = db.Column(db.DateTime)
+    delivered_at = db.Column(db.DateTime)
+    error = db.Column(db.String(1000))
+    __table_args__ = (
+        db.UniqueConstraint('issue_id', 'recipient_email', 'email_type', name='uq_email_issue_recipient_type'),
+    )
+
+class EmailWebhookReceipt(db.Model):
+    __tablename__ = 'email_webhook_receipts'
+    id = db.Column(db.Integer, primary_key=True)
+    provider_event_id = db.Column(db.String(160), nullable=False, unique=True)
+    delivery_id = db.Column(db.Integer, db.ForeignKey('email_deliveries.id'), nullable=False)
+    event_type = db.Column(db.String(60), nullable=False)
+    received_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+EMAIL_EVENT_LABELS = {
+    'created': 'New complaint',
+    'assigned': 'Department assignment',
+    'in_progress': 'Work in progress',
+    'completed': 'Work completed',
+}
+
+def absolute_app_url(path=''):
+    base = os.getenv('APP_BASE_URL', request.url_root).rstrip('/')
+    return f'{base}/{path.lstrip("/")}' if path else base
+
+def issue_dashboard_url(issue):
+    return f'{absolute_app_url()}?report=UP-{issue.id:04d}'
+
+def build_email_payload(issue, event, recipient):
+    label = EMAIL_EVENT_LABELS[event]
+    report_id = f'UP-{issue.id:04d}'
+    location = issue.geotag_address or 'Not provided'
+    category = issue.title if issue.issue_type == 'waste' else 'Pothole'
+    status_label = issue.status.replace('_', ' ').title()
+    submitted = issue.created_at.isoformat() if issue.created_at else 'Unknown'
+    completed = issue.completed_at.isoformat() if issue.completed_at else ''
+    description = html.escape(issue.description or '')
+    url = html.escape(issue_dashboard_url(issue), quote=True)
+    details = [
+        f'<p><b>Complaint ID:</b> {report_id}</p>',
+        f'<p><b>Category:</b> {html.escape(category)}</p>',
+        f'<p><b>Location:</b> {html.escape(location)}</p>',
+        f'<p><b>Description:</b> {description}</p>',
+        f'<p><b>Submitted:</b> {html.escape(submitted)}</p>',
+        f'<p><b>Status:</b> {html.escape(status_label)}</p>',
+    ]
+    if issue.assigned_department:
+        details.append(f'<p><b>Department:</b> {html.escape(issue.assigned_department)}</p>')
+    if event == 'completed':
+        details.extend([
+            f'<p><b>Completed:</b> {html.escape(completed)}</p>',
+            f'<p><b>Completion details:</b> {html.escape(issue.updates[-1].update_text if issue.updates else "")}</p>',
+        ])
+
+    images = []
+    attachments = []
+    urls = [('Before photograph', issue.image_url)]
+    if issue.completion_image_url:
+        urls.append(('After photograph', issue.completion_image_url))
+    for label_text, image_url in urls:
+        if not image_url:
+            continue
+        filename = Path(image_url).name
+        uploaded = db.session.get(UploadedImage, filename)
+        if uploaded:
+            attachments.append({
+                'filename': filename,
+                'content': base64.b64encode(uploaded.content).decode('ascii'),
+                'content_type': uploaded.mimetype,
+            })
+        absolute_image_url = html.escape(absolute_app_url(image_url), quote=True)
+        images.append(f'<p><b>{html.escape(label_text)}:</b><br><a href="{absolute_image_url}">{absolute_image_url}</a></p>')
+
+    subject = f'UrbanPulse {label}: {report_id} — {location}'
+    body = (
+        f'<h2>UrbanPulse — {html.escape(label)}</h2>'
+        + ''.join(details)
+        + ''.join(images)
+        + f'<p><a href="{url}">View complaint in UrbanPulse</a></p>'
+    )
+    text_body = '\n'.join([
+        f'UrbanPulse — {label}', f'Complaint ID: {report_id}', f'Category: {category}',
+        f'Location: {location}', f'Description: {issue.description or ""}',
+        f'Submitted: {submitted}', f'Status: {status_label}',
+        *( [f'Completed: {completed}'] if completed else [] ),
+        f'View complaint: {issue_dashboard_url(issue)}',
+    ])
+    return {
+        'from': os.getenv('RESEND_FROM_EMAIL', 'UrbanPulse <onboarding@resend.dev>'),
+        'to': [recipient], 'subject': subject, 'html': body, 'text': text_body,
+        'attachments': attachments,
+    }
+
+def send_email_delivery(delivery, issue):
+    api_key = os.getenv('RESEND_API_KEY', '').strip()
+    sender = os.getenv('RESEND_FROM_EMAIL', '').strip()
+    if not api_key or not sender:
+        delivery.status = 'not_configured'
+        missing = [name for name, value in [('RESEND_API_KEY', api_key), ('RESEND_FROM_EMAIL', sender)] if not value]
+        delivery.error = f'{", ".join(missing)} is not configured.'
+        db.session.commit()
+        return
+
+    payload = build_email_payload(issue, delivery.email_type, delivery.recipient_email)
+    delivery.status = 'pending'
+    delivery.error = None
+    delivery.last_attempt_at = datetime.utcnow()
+    delivery.attempt_count = (delivery.attempt_count or 0) + 1
+    db.session.commit()
+    try:
+        response = requests.post(
+            'https://api.resend.com/emails',
+            headers={
+                'Authorization': f'Bearer {api_key}',
+                'Content-Type': 'application/json',
+                'Idempotency-Key': delivery.idempotency_key,
+            },
+            json=payload,
+            timeout=15,
+        )
+        if not response.ok:
+            delivery.status = 'failed'
+            delivery.error = f'Resend API returned HTTP {response.status_code}: {response.text[:700]}'
+        else:
+            result = response.json()
+            provider_id = result.get('id')
+            if not provider_id:
+                delivery.status = 'unknown'
+                delivery.error = 'Resend accepted an unexpected response without an email ID.'
+            else:
+                # Provider acceptance is not final recipient delivery.
+                delivery.status = 'accepted'
+                delivery.provider_email_id = provider_id
+                delivery.accepted_at = datetime.utcnow()
+    except requests.Timeout:
+        delivery.status = 'unknown'
+        delivery.error = 'Resend request timed out; delivery is unconfirmed. Check provider events before retrying.'
+    except (requests.RequestException, ValueError) as error:
+        delivery.status = 'unknown'
+        delivery.error = f'Resend request outcome is unconfirmed: {str(error)[:700]}'
+    db.session.commit()
+
+def notify_issue_by_email(issue, event, recipient_list=None):
+    if recipient_list is None:
+        recipients = [os.getenv('ADMIN_EMAIL', 'dk142252@gmail.com').strip(), os.getenv('DEPARTMENT_EMAIL', '').strip()]
+    else:
+        recipients = recipient_list
+    recipients = list(dict.fromkeys(address.lower() for address in recipients if address and address.strip()))
+    for recipient in recipients:
+        delivery = EmailDelivery.query.filter_by(issue_id=issue.id, recipient_email=recipient, email_type=event).first()
+        if delivery:
+            continue
+        digest = hashlib.sha256(f'urbanpulse:{issue.id}:{event}:{recipient}'.encode()).hexdigest()
+        delivery = EmailDelivery(
+            issue_id=issue.id,
+            recipient_email=recipient,
+            email_type=event,
+            status='pending',
+            idempotency_key=digest,
+        )
+        db.session.add(delivery)
+        db.session.commit()
+        send_email_delivery(delivery, issue)
+
+def verify_resend_webhook(raw_body):
+    secret = os.getenv('RESEND_WEBHOOK_SECRET', '').strip()
+    if not secret:
+        return False
+    msg_id = request.headers.get('svix-id', '')
+    timestamp = request.headers.get('svix-timestamp', '')
+    signatures = request.headers.get('svix-signature', '')
+    try:
+        if abs(datetime.utcnow().timestamp() - int(timestamp)) > 300:
+            return False
+        key = base64.b64decode(secret.removeprefix('whsec_'))
+        signed = f'{msg_id}.{timestamp}.'.encode() + raw_body
+        expected = base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+        return any(
+            hmac.compare_digest(signature, expected)
+            for part in signatures.split()
+            for version, separator, signature in [part.partition(',')]
+            if separator and version == 'v1'
+        )
+    except (ValueError, TypeError):
+        return False
+
 
 # ============ ERROR HANDLERS ============
 
@@ -294,6 +501,10 @@ def ensure_database_ready():
     global DATABASE_READY
     if not DATABASE_READY:
         db.create_all()
+        issue_columns = {column['name'] for column in inspect(db.engine).get_columns('issues')}
+        if 'assigned_department' not in issue_columns:
+            db.session.execute(text('ALTER TABLE issues ADD COLUMN assigned_department VARCHAR(120)'))
+            db.session.commit()
         seed_demo_data()
         DATABASE_READY = True
 
@@ -363,9 +574,11 @@ def create_issue():
     )
     db.session.add(issue)
     db.session.commit()
+    notify_issue_by_email(issue, 'created')
     send_telegram(issue, 'created')
     db.session.commit()
-    return jsonify({'success': True, 'issue': issue.to_dict()}), 201
+    email_statuses = [row.status for row in EmailDelivery.query.filter_by(issue_id=issue.id, email_type='created').all()]
+    return jsonify({'success': True, 'issue': issue.to_dict(), 'email_statuses': email_statuses}), 201
 
 
 @app.route('/api/issues/<int:issue_id>/complete', methods=['POST'])
@@ -393,6 +606,7 @@ def complete_issue(issue_id):
         image_url=issue.completion_image_url,
     ))
     db.session.commit()
+    notify_issue_by_email(issue, 'completed')
     send_telegram(issue, 'completed')
     db.session.commit()
     return jsonify({'success': True, 'issue': issue.to_dict()})
@@ -405,9 +619,124 @@ def update_issue_status(issue_id):
     status = (request.get_json() or {}).get('status')
     if status not in {'pending', 'in_progress'}:
         return jsonify({'success': False, 'error': 'Choose pending or in_progress; completion requires an after photo.'}), 400
+    previous_status = issue.status
     issue.status = status
     db.session.commit()
+    if status == 'in_progress' and previous_status != 'in_progress':
+        notify_issue_by_email(issue, 'in_progress')
     return jsonify({'success': True, 'issue': issue.to_dict()})
+
+@app.route('/api/issues/<int:issue_id>/assign', methods=['POST'])
+def assign_issue(issue_id):
+    if not require_admin():
+        return jsonify({'success': False, 'error': 'Administrator key required.'}), 403
+    issue = Issue.query.get_or_404(issue_id)
+    department = ((request.get_json() or {}).get('department') or '').strip()
+    if not department:
+        return jsonify({'success': False, 'error': 'A municipal department is required.'}), 400
+    if len(department) > 120:
+        return jsonify({'success': False, 'error': 'Department name must be 120 characters or fewer.'}), 400
+    issue.assigned_department = department
+    issue.assigned_at = datetime.utcnow()
+    if issue.status in {'new_report', 'pending'}:
+        issue.status = 'assigned'
+    db.session.commit()
+    department_email = os.getenv('DEPARTMENT_EMAIL', '').strip()
+    notify_issue_by_email(issue, 'assigned', [department_email] if department_email else [])
+    if not department_email:
+        # Persist the assignment; email configuration is tracked separately and
+        # cannot make the complaint itself fail.
+        return jsonify({'success': True, 'issue': issue.to_dict(), 'email_status': 'not_configured'}), 200
+    return jsonify({'success': True, 'issue': issue.to_dict()}), 200
+
+@app.route('/api/email/status', methods=['GET'])
+def email_status():
+    if not require_admin():
+        return jsonify({'success': False, 'error': 'Administrator key required.'}), 403
+    rows = EmailDelivery.query.order_by(EmailDelivery.created_at.desc()).limit(100).all()
+    return jsonify({
+        'configured': bool(os.getenv('RESEND_API_KEY') and os.getenv('RESEND_FROM_EMAIL') and os.getenv('ADMIN_EMAIL', 'dk142252@gmail.com') and os.getenv('APP_BASE_URL')),
+        'department_configured': bool(os.getenv('DEPARTMENT_EMAIL')),
+        'webhook_configured': bool(os.getenv('RESEND_WEBHOOK_SECRET')),
+        'deliveries': [{
+            'id': row.id, 'issue_id': row.issue_id, 'recipient_email': row.recipient_email,
+            'email_type': row.email_type, 'status': row.status,
+            'provider_email_id': row.provider_email_id,
+            'created_at': row.created_at.isoformat() if row.created_at else None,
+            'last_attempt_at': row.last_attempt_at.isoformat() if row.last_attempt_at else None,
+            'accepted_at': row.accepted_at.isoformat() if row.accepted_at else None,
+            'delivered_at': row.delivered_at.isoformat() if row.delivered_at else None,
+            'attempt_count': row.attempt_count, 'error': row.error,
+        } for row in rows],
+    })
+
+@app.route('/api/email/retry/<int:delivery_id>', methods=['POST'])
+def retry_email(delivery_id):
+    if not require_admin():
+        return jsonify({'success': False, 'error': 'Administrator key required.'}), 403
+    delivery = db.session.get(EmailDelivery, delivery_id)
+    if not delivery:
+        return jsonify({'success': False, 'error': 'Email delivery record not found.'}), 404
+    if delivery.status not in {'failed', 'not_configured'}:
+        return jsonify({'success': False, 'error': 'Only failed or not-configured deliveries can be retried.'}), 409
+    if delivery.last_attempt_at and datetime.utcnow() - delivery.last_attempt_at > timedelta(hours=23):
+        return jsonify({'success': False, 'error': 'Safe retry window expired. Resend idempotency keys are retained for 24 hours; verify provider history before any manual resend.'}), 409
+    issue = db.session.get(Issue, delivery.issue_id)
+    if not issue:
+        return jsonify({'success': False, 'error': 'Complaint not found.'}), 404
+    send_email_delivery(delivery, issue)
+    return jsonify({'success': True, 'delivery': {
+        'id': delivery.id, 'status': delivery.status, 'error': delivery.error,
+        'attempt_count': delivery.attempt_count,
+    }})
+
+@app.route('/api/email/webhook', methods=['POST'])
+def resend_webhook():
+    raw_body = request.get_data(cache=True)
+    if not verify_resend_webhook(raw_body):
+        return jsonify({'success': False, 'error': 'Invalid or unconfigured webhook signature.'}), 401
+    try:
+        event = json.loads(raw_body)
+    except ValueError:
+        return jsonify({'success': False, 'error': 'Invalid JSON.'}), 400
+    provider_event_id = request.headers.get('svix-id', '')
+    if provider_event_id and EmailWebhookReceipt.query.filter_by(provider_event_id=provider_event_id).first():
+        return jsonify({'success': True, 'duplicate': True}), 200
+    data = event.get('data') or {}
+    provider_email_id = data.get('email_id') or data.get('id')
+    delivery = EmailDelivery.query.filter_by(provider_email_id=provider_email_id).first() if provider_email_id else None
+    if not delivery:
+        return jsonify({'success': True, 'ignored': True}), 200
+    type_status = {
+        'email.sent': 'accepted',
+        'email.delivered': 'delivered',
+        'email.delivery_delayed': 'delayed',
+        'email.failed': 'failed',
+        'email.bounced': 'bounced',
+        'email.complained': 'complained',
+        'email.suppressed': 'suppressed',
+    }
+    next_status = type_status.get(event.get('type'))
+    if not next_status:
+        return jsonify({'success': True, 'ignored': True}), 200
+    if provider_event_id:
+        db.session.add(EmailWebhookReceipt(
+            provider_event_id=provider_event_id,
+            delivery_id=delivery.id,
+            event_type=event.get('type', ''),
+        ))
+    terminal = {'delivered', 'failed', 'bounced', 'complained', 'suppressed'}
+    terminal = {'delivered', 'failed', 'bounced', 'complained', 'suppressed'}
+    was_terminal = delivery.status in terminal
+    if not was_terminal:
+        delivery.status = next_status
+    if next_status == 'delivered' and not was_terminal:
+        delivery.delivered_at = datetime.utcnow()
+        delivery.error = None
+    elif next_status in terminal | {'delayed'} and not was_terminal:
+        delivery.error = str(data.get('reason') or data.get('bounce', {}).get('message') or event.get('type'))[:1000]
+    db.session.commit()
+    return jsonify({'success': True}), 200
 
 @app.route('/api/telegram/status')
 def telegram_status():

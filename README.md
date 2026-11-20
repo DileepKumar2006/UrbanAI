@@ -1,11 +1,11 @@
 # UrbanPulse
 
-UrbanPulse is a React and Flask civic issue reporting app. It supports pothole and waste photo reports, persistent report history, department status updates, before and after completion photos, and optional Telegram delivery.
+UrbanPulse is a React and Flask civic issue reporting app. It supports pothole and waste photo reports, persistent report history, department status updates, before and after completion photos, email notifications through Resend, and Telegram notifications.
 
 ## Run locally
 
 1. In `backend`, create/activate a Python environment and install `requirements.txt`.
-2. Copy `backend/.env.example` to `backend/.env`. For a local SQLite database set `DATABASE_URL=sqlite:///urban_ai.db`; the database file is stored under `backend` when Flask is started from that directory. Set a private `URBANPULSE_ADMIN_KEY`. Telegram variables can remain empty until a bot and group are configured.
+2. Copy `backend/.env.example` to `backend/.env`. For a local SQLite database set `DATABASE_URL=sqlite:///urban_ai.db`; the database file is stored under `backend` when Flask is started from that directory. Set a private `URBANPULSE_ADMIN_KEY`. Email is recorded as `not_configured` until valid Resend settings are provided; the complaint itself is still saved.
 3. Start the backend from `backend`: `python app.py` (port 5000).
 4. In another terminal, run `npm install` and `npm start` from `frontend` (port 3000).
 5. Open Settings in UrbanPulse and enter the same `URBANPULSE_ADMIN_KEY` to enable status and completion actions in that browser session.
@@ -16,13 +16,30 @@ The frontend can point to another backend with `REACT_APP_API_URL` before starti
 
 On the HTTPS deployment (or `localhost`), a reporter can choose **Use current location** in the report form. The browser then asks for location permission and captures one high-accuracy GPS fix; the coordinates and the reporter-entered street or landmark are saved with the report. Location is optional, and no continuous tracking occurs. If permission is denied or the device cannot get a fix, the reporter can still submit with a manually entered location. The browser must support Geolocation and the user must grant permission for GPS capture.
 
+## Email notifications with Resend
+
+Configure these **backend** environment variables (never put the API key in React variables):
+
+- `RESEND_API_KEY`: Resend API key.
+- `RESEND_FROM_EMAIL`: sender using a verified domain in Resend. Resend's `onboarding@resend.dev` sender is for testing only.
+- `ADMIN_EMAIL`: administrator recipient; defaults to `dk142252@gmail.com`.
+- `DEPARTMENT_EMAIL`: municipal department inbox for assignment and complaint updates.
+- `APP_BASE_URL`: public UrbanPulse URL used for complaint and photograph links.
+- `RESEND_WEBHOOK_SECRET`: signing secret for the Resend webhook (recommended for delivery tracking).
+
+The backend sends new complaint emails to the admin and configured department, assignment email to the department, and Work in Progress/completion emails to both. Complaint photos and after-repair photos are attached when present, and each message includes the original complaint link. Email failures do not roll back or hide complaints. Each recipient/event is logged in `email_deliveries`; Resend acceptance is recorded as `accepted`, and only a verified `email.delivered` webhook sets `delivered`. Bounces, provider failures, delayed delivery and complaints update that log as well. Administrators can inspect deliveries and retry determinate failures in Settings; retries use a stable Resend idempotency key and are limited to the provider's 24-hour idempotency window.
+
+In Resend, verify the sender domain, create a webhook for `https://YOUR-APP-URL/api/email/webhook`, select `email.sent`, `email.delivered`, `email.delivery_delayed`, `email.failed`, `email.bounced`, and `email.complained`, then save its signing secret as `RESEND_WEBHOOK_SECRET`. Resend documents idempotency keys for duplicate-safe sends and webhooks for delivery events: [Idempotency keys](https://resend.com/changelog/idempotency-keys), [webhooks](https://resend.com/features/webhooks).
+
+After configuring Render environment variables, wait for deployment. Submit a fresh pothole and waste report, assign each to a department, mark one Work in Progress, and complete one with an after photo. Confirm the emails in the recipient inboxes and check for `delivered` rows in UrbanPulse Settings. Without valid Resend credentials, a verified sender and department address, and a webhook secret, live email delivery cannot be claimed.
+
 ## Telegram setup
 
 Create a bot with Telegram's BotFather, add it to the target administrator group, and set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` only in the backend environment. Restart the backend. The Settings screen reports whether the values are configured and displays per-event delivery state. A delivery is considered successful only when Telegram's API accepts the message; the app records `sent`, `failed`, or `not_configured`. New report and completion events are deduplicated per report/event. Do not put the bot token in frontend variables.
 
 ## Data and deployment notes
 
-Reports, status, completion updates, uploaded image bytes, and Telegram delivery attempts use the SQLAlchemy database. Uploaded photos therefore survive application redeploys. The Render Blueprint deploys the React frontend and Flask API together and provisions a free Postgres database for preview use. Render free Postgres databases expire after 30 days; upgrade the database before relying on the deployment for ongoing reporting. The admin key is generated by Render and can be viewed in the service environment settings.
+Reports, status, completion updates, uploaded image bytes, Telegram attempts, email delivery records, and webhook receipts use the SQLAlchemy database. Uploaded photos therefore survive application redeploys. The Render Blueprint deploys the React frontend and Flask API together and provisions a free Postgres database for preview use. Render free Postgres databases expire after 30 days; upgrade the database before relying on the deployment for ongoing reporting. The admin key is generated by Render and can be viewed in the service environment settings. Startup adds the new email table and the department assignment field to existing databases.
 
 The three supplied road photographs are in `frontend/public/reference-photos` and appear only as reference examples; they are not fabricated reports. The database is no longer seeded with sample issue records.
 

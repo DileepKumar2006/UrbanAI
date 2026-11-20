@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime
 from io import BytesIO
 from unittest.mock import Mock, patch
+from PIL import Image
 import werkzeug
 
 # Flask 2.3's test client still reads this legacy attribute; Werkzeug 3 removed it.
@@ -23,7 +24,8 @@ os.environ.update({
     'APP_BASE_URL': 'https://urbanpulse.example',
 })
 
-from app import app, db, EmailDelivery, Issue, UploadedImage
+from app import app, db, EmailDelivery, Issue, UploadedImage, User
+from werkzeug.security import generate_password_hash
 
 
 class ComplaintEmailWorkflowTest(unittest.TestCase):
@@ -51,7 +53,10 @@ class ComplaintEmailWorkflowTest(unittest.TestCase):
         db.drop_all()
         self.context.pop()
 
-    def submit_report(self, issue_type):
+    def submit_report(self, issue_type, headers=None):
+        photo = BytesIO()
+        Image.new('RGB', (4, 4), color='red').save(photo, format='JPEG')
+        photo.seek(0)
         return self.client.post('/api/issues', data={
             'issue_type': issue_type,
             'category': 'Mixed Waste',
@@ -59,8 +64,8 @@ class ComplaintEmailWorkflowTest(unittest.TestCase):
             'geotag_address': 'Test Main Road',
             'latitude': '12.3',
             'longitude': '77.6',
-            'image': (BytesIO(b'fake-jpeg-image-content'), 'before.jpg', 'image/jpeg'),
-        }, content_type='multipart/form-data')
+            'image': (photo, 'before.jpg', 'image/jpeg'),
+        }, headers=headers, content_type='multipart/form-data')
 
     def test_new_pothole_and_waste_send_email_with_photo_and_dashboard_link(self):
         pothole = self.submit_report('pothole')
@@ -88,7 +93,7 @@ class ComplaintEmailWorkflowTest(unittest.TestCase):
         self.assertEqual(progress.status_code, 200)
         completed = self.client.post(f'/api/issues/{issue_id}/complete', data={
             'update_text': 'Road repair completed successfully.',
-            'image': (BytesIO(b'fake-after-image'), 'after.jpg', 'image/jpeg'),
+            'image': (self.jpeg(), 'after.jpg', 'image/jpeg'),
         }, headers=admin_headers, content_type='multipart/form-data')
         self.assertEqual(completed.status_code, 200)
         self.assertEqual(db.session.get(Issue, issue_id).status, 'completed')
@@ -135,6 +140,117 @@ class ComplaintEmailWorkflowTest(unittest.TestCase):
         self.assertEqual(retry.status_code, 200)
         self.assertEqual(self.resend.call_args_list[-1].kwargs['headers']['Idempotency-Key'], first_key)
         self.assertEqual(Issue.query.count(), 1)
+
+    @staticmethod
+    def jpeg():
+        photo = BytesIO()
+        Image.new('RGB', (4, 4), color='blue').save(photo, format='JPEG')
+        photo.seek(0)
+        return photo
+
+    def test_public_issue_list_hides_exact_location_and_description(self):
+        self.submit_report('pothole')
+        public = self.client.get('/api/issues').get_json()['items'][0]
+        self.assertNotIn('latitude', public)
+        self.assertNotIn('longitude', public)
+        self.assertNotIn('geotag_address', public)
+        self.assertNotIn('description', public)
+        self.assertNotIn('image_url', public)
+        private = self.client.get('/api/issues', headers={'X-Admin-Key': 'test-admin-key'}).get_json()['items'][0]
+        self.assertEqual(private['latitude'], 12.3)
+        self.assertEqual(private['description'], 'Test pothole report details')
+
+    def test_bad_image_is_rejected_and_admin_jwt_is_authorized(self):
+        bad = self.client.post('/api/issues', data={
+            'issue_type': 'pothole', 'description': 'Bad file',
+            'geotag_address': 'Test Road', 'latitude': '1', 'longitude': '2',
+            'image': (BytesIO(b'not an image'), 'bad.jpg', 'image/jpeg'),
+        }, content_type='multipart/form-data')
+        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(Issue.query.count(), 0)
+        user = User(username='reviewer', email='reviewer@example.com',
+                    password_hash=generate_password_hash('long-test-password'), role='admin')
+        db.session.add(user)
+        db.session.commit()
+        response = self.client.post('/api/auth/login', json={
+            'username': 'reviewer', 'password': 'long-test-password',
+        })
+        self.assertEqual(response.status_code, 200)
+        token = response.get_json()['access_token']
+        submitted = self.submit_report('pothole')
+        issue_id = submitted.get_json()['issue']['id']
+        admin_headers = {'Authorization': f'Bearer {token}'}
+        self.assertEqual(self.client.patch(f'/api/issues/{issue_id}/status', json={
+            'status': 'in_progress',
+        }, headers=admin_headers).status_code, 200)
+        self.assertEqual(self.client.post(f'/api/issues/{issue_id}/escalate', headers=admin_headers).status_code, 200)
+        self.assertEqual(self.client.post(f'/api/issues/{issue_id}/escalate').status_code, 403)
+        self.assertEqual(self.client.post(f'/api/issues/{issue_id}/escalate', headers={
+            'Authorization': f'Bearer {token}',
+        }).status_code, 200)
+
+    def test_citizen_owns_private_report_and_signed_photo_access(self):
+        signup = self.client.post('/api/auth/register', json={
+            'username': 'citizen-one', 'email': 'citizen@example.com',
+            'password': 'citizen-long-password',
+        })
+        self.assertEqual(signup.status_code, 201)
+        token = signup.get_json()['access_token']
+        headers = {'Authorization': f'Bearer {token}'}
+        submitted = self.submit_report('pothole', headers=headers)
+        issue_id = submitted.get_json()['issue']['id']
+        self.assertEqual(db.session.get(Issue, issue_id).created_by, signup.get_json()['user']['id'])
+        own = self.client.get('/api/issues', headers=headers).get_json()['items']
+        self.assertEqual(len(own), 1)
+        self.assertEqual(own[0]['description'], 'Test pothole report details')
+        image_url = own[0]['image_url']
+        self.assertIn('?access=', image_url)
+        image_response = self.client.get(image_url)
+        self.assertEqual(image_response.status_code, 200)
+        direct_path = image_url.split('?')[0]
+        self.assertEqual(self.client.get(direct_path).status_code, 403)
+        self.assertEqual(self.client.patch(f'/api/issues/{issue_id}/status',
+                                           json={'status': 'in_progress'}, headers=headers).status_code, 403)
+        logout = self.client.post('/api/auth/logout', headers=headers)
+        self.assertEqual(logout.status_code, 200)
+        self.assertEqual(self.client.get('/api/issues', headers=headers).get_json()['items'][0].get('description'), None)
+
+    def test_invalid_login_and_database_health(self):
+        denied = self.client.post('/api/auth/login', json={
+            'username': 'missing-user', 'password': 'invalid-password',
+        })
+        self.assertEqual(denied.status_code, 401)
+        health = self.client.get('/api/health')
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.get_json()['database'], 'connected')
+        self.assertEqual(health.headers.get('X-Content-Type-Options'), 'nosniff')
+        with patch.object(db.session, 'execute', side_effect=RuntimeError('database unavailable')):
+            unhealthy = self.client.get('/api/health')
+        self.assertEqual(unhealthy.status_code, 503)
+        self.assertEqual(unhealthy.get_json()['database'], 'unavailable')
+
+    def test_assigned_department_officer_can_update_only_assigned_work(self):
+        response = self.submit_report('pothole')
+        issue_id = response.get_json()['issue']['id']
+        admin_headers = {'X-Admin-Key': 'test-admin-key'}
+        self.client.post(f'/api/issues/{issue_id}/assign', json={'department': 'Roads Department'}, headers=admin_headers)
+        created = self.client.post('/api/auth/register-department', json={
+            'username': 'roads-officer', 'email': 'roads@example.com',
+            'department': 'Roads Department', 'password': 'roads-long-password',
+        }, headers=admin_headers)
+        self.assertEqual(created.status_code, 201)
+        login = self.client.post('/api/auth/login', json={
+            'username': 'roads-officer', 'password': 'roads-long-password',
+        })
+        officer_headers = {'Authorization': f"Bearer {login.get_json()['access_token']}"}
+        self.assertEqual(self.client.patch(f'/api/issues/{issue_id}/status', json={
+            'status': 'in_progress',
+        }, headers=officer_headers).status_code, 200)
+        private = self.client.get('/api/issues', headers=officer_headers).get_json()['items'][0]
+        self.assertEqual(private['geotag_address'], 'Test Main Road')
+        self.assertEqual(self.client.post(f'/api/issues/{issue_id}/assign', json={
+            'department': 'Other Department',
+        }, headers=officer_headers).status_code, 403)
 
 
 if __name__ == '__main__':

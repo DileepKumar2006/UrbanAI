@@ -5,12 +5,44 @@ UrbanPulse is a React and Flask civic issue reporting app. It supports pothole a
 ## Run locally
 
 1. In `backend`, create/activate a Python environment and install `requirements.txt`.
-2. Copy `backend/.env.example` to `backend/.env`. For a local SQLite database set `DATABASE_URL=sqlite:///urban_ai.db`; the database file is stored under `backend` when Flask is started from that directory. Set a private `URBANPULSE_ADMIN_KEY`. Email is recorded as `not_configured` until valid Resend settings are provided; the complaint itself is still saved.
-3. Start the backend from `backend`: `python app.py` (port 5000).
-4. In another terminal, run `npm install` and `npm start` from `frontend` (port 3000).
-5. Open Settings in UrbanPulse and enter the same `URBANPULSE_ADMIN_KEY` to enable status and completion actions in that browser session.
+2. Copy `backend/.env.example` to `backend/.env`. For local SQLite set `DATABASE_URL=sqlite:///urban_ai.db`. Set private `URBANPULSE_ADMIN_KEY` and a stable random `JWT_SECRET_KEY` (generate one with `python -c "import secrets; print(secrets.token_urlsafe(48))"`). Email is recorded as `not_configured` until valid Resend settings are provided; the complaint itself is still saved.
+3. From `backend`, initialize or update the schema with `flask --app app db upgrade` before starting the backend. This is an explicit migration command; the web process no longer creates or changes tables at request time.
+4. Start the backend from `backend`: `python app.py` (port 5000).
+5. In another terminal, run `npm install` and `npm start` from `frontend` (port 3000).
+6. Create or sign in to an account in Settings. Citizens can view their own reports; administrators and department officers use their account roles for authorized actions. The legacy `URBANPULSE_ADMIN_KEY` remains available for existing administrators.
 
 The frontend can point to another backend with `REACT_APP_API_URL` before starting or building it. Photo capture uses the browser camera picker where supported; otherwise users can choose a local image. Photo uploads are citizen initiated and do not perform automatic monitoring or AI detection.
+
+### Database migrations and safe upgrades
+
+Schema changes are managed through Flask-Migrate/Alembic. The first migration is additive: it creates only missing model tables, adds `issues.assigned_department` if absent, and creates missing query indexes. It does not delete or rewrite existing rows. To create a later migration, run `flask --app app db migrate -m "describe change"`, review its generated file, then apply it with `flask --app app db upgrade`. `flask --app app db current` shows the applied revision. Downgrading this baseline is intentionally a no-op because dropping baseline tables could erase complaints; use a reviewed later migration or database restore for rollback. Before applying a migration to production, take a provider snapshot/dump and verify restore into a separate database. No production backup has been taken or restore-tested in this session, so do not migrate the live Render database yet. Keep future changes as versioned migrations; do not use request-time `create_all()` to upgrade production.
+
+The web container does not run migrations automatically. Initialize a new database with `flask --app app db upgrade` before serving traffic. For an existing database, snapshot and restore-test it first, then run the same command during a controlled maintenance window. To roll back an application release, redeploy the previous code; use a database restore for destructive migration rollback rather than dropping baseline tables.
+
+`CORS_ORIGINS` is a comma-separated backend setting. Defaults permit local React development origins; add the exact production UI origin only if frontend and API are hosted separately. `RATELIMIT_STORAGE_URI` defaults to process-local memory for a single instance; configure Redis before running multiple web instances so submission limits are shared.
+
+After migrating, create an administrator interactively with `flask --app app create-admin`. This creates a hashed-password account; authenticate with `POST /api/auth/login` to receive a role-bearing JWT. Citizen registration is available through Settings and `POST /api/auth/register`; an administrator can provision department officers through `POST /api/auth/register-department`. JWTs expire after eight hours and logout revokes the token in the database. Citizens see their own reports, department officers see reports assigned to their department, and administrators can review all reports. The dashboard retains `URBANPULSE_ADMIN_KEY` for compatibility; prefer account tokens for regular use. The placeholder demo seeding command has been removed.
+
+Public complaint lists omit exact coordinates, street addresses, descriptions, internal assignment details, and report images. Private report images are served through short-lived signed links for the report owner, assigned department, or administrator. Important submissions and management changes are written to `audit_logs`; administrators can review them through `GET /api/admin/audit`.
+
+### Backup and restore checklist
+
+For local SQLite, run these from `backend` before schema work:
+
+```powershell
+python -c "import sqlite3; src=sqlite3.connect('urban_ai.db'); dst=sqlite3.connect('urban_ai_backup.db'); src.backup(dst); dst.close(); src.close()"
+python -c "import sqlite3; db=sqlite3.connect('urban_ai_backup.db'); print(db.execute('PRAGMA integrity_check').fetchone()[0]); db.close()"
+```
+
+To verify a restore without touching the working database, restore the backup into a separate file and check its integrity and row counts before approving a migration. For PostgreSQL, create a provider snapshot or run `pg_dump --format=custom --file=urbanai-backup.dump "$PRODUCTION_DATABASE_URL"`; verify restoration into a separate database with `pg_restore --dbname="$RESTORE_CHECK_DATABASE_URL" urbanai-backup.dump`. Keep backup files out of Git and restrict access because they contain complaint data and photographs.
+
+### Tests
+
+From `backend`, run `python -m unittest discover -s . -p "test_*.py"`. From `frontend`, run `npm test -- --watchAll=false` and `npm run build`. The migration test should use a restored copy of the database, never the production database. Check that the original and migrated copy retain the same existing complaint, user, image, and notification row counts.
+
+### Production configuration and rollout
+
+Set `DATABASE_URL`, a long random `JWT_SECRET_KEY`, `URBANPULSE_ADMIN_KEY` for legacy clients, exact `CORS_ORIGINS`, and the Resend variables listed above in the hosting provider’s secret settings. Do not use the example values in production. Make a verified backup, apply `flask --app app db upgrade` as a controlled pre-release step, check `/api/health`, then deploy the application. The container intentionally does not auto-migrate. Keep the previous app release available for code rollback; use a database restore if a future migration cannot be safely reversed. Resend testing senders may be restricted to verified recipients; configure a verified sender domain before expecting external municipal delivery.
 
 ### GPS location on reports
 
@@ -35,7 +67,7 @@ After configuring Render environment variables, wait for deployment. Submit a fr
 
 ## Data and deployment notes
 
-Reports, status, completion updates, uploaded image bytes, email delivery records, and webhook receipts use the SQLAlchemy database. Uploaded photos therefore survive application redeploys. The Render Blueprint deploys the React frontend and Flask API together and provisions a free Postgres database for preview use. Render free Postgres databases expire after 30 days; upgrade the database before relying on the deployment for ongoing reporting. The admin key is generated by Render and can be viewed in the service environment settings. Startup adds the new email table and the department assignment field to existing databases.
+Reports, status, completion updates, uploaded image bytes, email delivery records, and webhook receipts use the SQLAlchemy database. Uploaded photos therefore survive application redeploys. The Render Blueprint deploys the React frontend and Flask API together and provisions a free Postgres database for preview use. Render free Postgres databases expire after 30 days; upgrade the database before relying on the deployment for ongoing reporting. The admin key is generated by Render and can be viewed in the service environment settings. Database changes are now explicit migrations rather than request-time table creation or `ALTER TABLE` calls.
 
 The three supplied road photographs are in `frontend/public/reference-photos` and appear only as reference examples; they are not fabricated reports. The database is no longer seeded with sample issue records.
 

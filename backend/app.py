@@ -6,7 +6,7 @@ Handles citizen pothole and waste reports and their completion history
 from flask import Flask, jsonify, request, send_from_directory, send_file, abort
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from flask_jwt_extended import JWTManager
+from flask_jwt_extended import JWTManager, create_access_token, get_jwt, get_jwt_identity, jwt_required, verify_jwt_in_request
 from datetime import datetime, timedelta
 import os
 import requests
@@ -15,11 +15,15 @@ import hashlib
 import hmac
 import html
 import json
+from getpass import getpass
 from werkzeug.utils import secure_filename
 from io import BytesIO
 from pathlib import Path
 from dotenv import load_dotenv
-from sqlalchemy import inspect, text
+from sqlalchemy import Index, or_, text
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from werkzeug.security import check_password_hash, generate_password_hash
+from PIL import Image, UnidentifiedImageError
 
 dotenv_path = Path(__file__).resolve().parent / '.env'
 load_dotenv(dotenv_path=dotenv_path)
@@ -30,19 +34,38 @@ load_dotenv(dotenv_path=dotenv_path)
 app = Flask(__name__, static_folder=None)
 
 # ============ CONFIGURATION ============
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
-    'DATABASE_URL',
-    f"sqlite:///{Path(__file__).resolve().parent / 'urban_ai.db'}"
-)
+is_production = os.getenv('FLASK_ENV', '').lower() == 'production'
+configured_database_url = os.getenv('DATABASE_URL')
+if is_production and not configured_database_url:
+    raise RuntimeError('DATABASE_URL must be configured in production.')
+if is_production and not configured_database_url.startswith(('postgres://', 'postgresql://')):
+    raise RuntimeError('Production DATABASE_URL must point to PostgreSQL.')
+if configured_database_url and configured_database_url.startswith('postgres://'):
+    configured_database_url = configured_database_url.replace('postgres://', 'postgresql://', 1)
+app.config['SQLALCHEMY_DATABASE_URI'] = configured_database_url or f"sqlite:///{Path(__file__).resolve().parent / 'urban_ai.db'}"
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+configured_jwt_secret = os.getenv('JWT_SECRET_KEY')
+if is_production and (not configured_jwt_secret or configured_jwt_secret.lower() in {'change-me', 'change-me-to-a-long-random-secret', 'your-secret-key-change-in-production'}):
+    raise RuntimeError('JWT_SECRET_KEY must be configured in production.')
+app.config['JWT_SECRET_KEY'] = configured_jwt_secret or os.urandom(32)
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=8)
 app.config['MAX_CONTENT_LENGTH'] = 12 * 1024 * 1024
-app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-secret-key-change-in-production')
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=30)
 
 # Initialize extensions
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
-CORS(app)
+from flask_migrate import Migrate
+migrate = Migrate(app, db, compare_type=True)
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri=os.getenv('RATELIMIT_STORAGE_URI', 'memory://'),
+)
+configured_origins = [origin.strip() for origin in os.getenv('CORS_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000').split(',') if origin.strip()]
+CORS(app, resources={r"/api/*": {"origins": configured_origins}})
 
 def save_uploaded_image(file):
     if not file or not file.filename:
@@ -55,12 +78,124 @@ def save_uploaded_image(file):
         raise ValueError('Unsupported image format.')
     filename = f'{datetime.utcnow().strftime("%Y%m%d%H%M%S%f")}-{filename}'
     content = file.read()
+    try:
+        with Image.open(BytesIO(content)) as image:
+            actual_format = image.format
+            if image.width * image.height > 40_000_000:
+                raise ValueError('Image dimensions are too large.')
+            image.verify()
+    except ValueError:
+        raise
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError):
+        raise ValueError('The uploaded file is not a valid image.')
+    actual_types = {'JPEG': ('image/jpeg', {'.jpg', '.jpeg'}), 'PNG': ('image/png', {'.png'}), 'WEBP': ('image/webp', {'.webp'})}
+    actual_type = actual_types.get(actual_format)
+    if not actual_type or actual_type[0] != file.mimetype or suffix not in actual_type[1]:
+        raise ValueError('Image contents do not match the selected file type.')
+    if not content:
+        raise ValueError('The uploaded image is empty.')
     db.session.add(UploadedImage(filename=filename, content=content, mimetype=file.mimetype))
     return f'/api/uploads/{filename}'
 
+
+def accept_existing_image_url(value):
+    if not isinstance(value, str) or not value.startswith('/api/uploads/'):
+        return ''
+    filename = value.removeprefix('/api/uploads/')
+    if not filename or secure_filename(filename) != filename or '/' in filename or '\\' in filename:
+        return ''
+    return value if db.session.get(UploadedImage, filename) else ''
+
 def require_admin():
     expected = os.getenv('URBANPULSE_ADMIN_KEY', '')
-    return bool(expected) and request.headers.get('X-Admin-Key', '') == expected
+    supplied = request.headers.get('X-Admin-Key', '')
+    if expected and hmac.compare_digest(supplied, expected):
+        return True
+    try:
+        verify_jwt_in_request(optional=True)
+        user = current_user()
+        return bool(user and user.role == 'admin')
+    except Exception:
+        return False
+
+
+def current_user():
+    try:
+        verify_jwt_in_request(optional=True)
+        identity = get_jwt_identity()
+        return db.session.get(User, int(identity)) if identity else None
+    except Exception:
+        return None
+
+
+def can_access_issue(issue, user=None):
+    user = user or current_user()
+    if not user:
+        return False
+    if user.role == 'admin':
+        return True
+    if user.role in {'manager', 'department_officer', 'worker'}:
+        return bool(user.department and issue.assigned_department and user.department.casefold() == issue.assigned_department.casefold())
+    return user.role == 'citizen' and issue.created_by == user.id
+
+
+def can_manage_issue(issue):
+    if require_admin():
+        return True
+    user = current_user()
+    return bool(user and user.role in {'manager', 'department_officer', 'worker'}
+                and user.department and issue.assigned_department
+                and user.department.casefold() == issue.assigned_department.casefold())
+
+
+def can_manage_any_issue():
+    if require_admin():
+        return True
+    user = current_user()
+    return bool(user and user.role in {'manager', 'department_officer', 'worker'})
+
+
+def audit_action(issue_id, action, details=''):
+    user = current_user()
+    db.session.add(AuditLog(actor_id=user.id if user else None, issue_id=issue_id,
+                            action=action, details=details[:500]))
+
+
+def image_token(issue, image_url):
+    if not image_url or not image_url.startswith('/api/uploads/'):
+        return image_url
+    filename = image_url.removeprefix('/api/uploads/')
+    token = URLSafeTimedSerializer(app.config['JWT_SECRET_KEY'], salt='urbanai-image-access').dumps({
+        'issue_id': issue.id, 'filename': filename,
+    })
+    return f'{image_url}?access={token}'
+
+
+def issue_dict_for_request(issue):
+    """Return private details only to an admin, owner, or assigned officer."""
+    payload = issue.to_dict()
+    user = current_user()
+    authorized = require_admin() or can_access_issue(issue, user)
+    if authorized:
+        payload['image_url'] = image_token(issue, issue.image_url)
+        payload['completion_image_url'] = image_token(issue, issue.completion_image_url)
+    else:
+        payload.pop('latitude', None)
+        payload.pop('longitude', None)
+        payload.pop('geotag_address', None)
+        payload.pop('description', None)
+        payload.pop('assigned_to', None)
+        payload.pop('assigned_manager', None)
+        payload.pop('created_by', None)
+        payload.pop('updates', None)
+        payload.pop('escalation_level', None)
+        payload.pop('escalation_status', None)
+        payload.pop('social_media_posted', None)
+        payload.pop('social_media_url', None)
+        payload.pop('image_url', None)
+        payload.pop('completion_image_url', None)
+        payload['area_name'] = issue.area_name or 'Location withheld'
+    return payload
 
 # ============ DATABASE MODELS ============
 
@@ -126,6 +261,12 @@ class Issue(db.Model):
     creator = db.relationship('User', foreign_keys=[created_by], backref='created_issues')
     escalations = db.relationship('EscalationLog', backref='issue', lazy=True, cascade='all, delete-orphan')
     updates = db.relationship('IssueUpdate', backref='issue', lazy=True, cascade='all, delete-orphan')
+    __table_args__ = (
+        Index('ix_issues_status_created_at', 'status', 'created_at'),
+        Index('ix_issues_type_status', 'issue_type', 'status'),
+        Index('ix_issues_department_status', 'assigned_department', 'status'),
+        Index('ix_issues_creator_created_at', 'created_by', 'created_at'),
+    )
     
     def to_dict(self):
         return {
@@ -241,6 +382,28 @@ class EmailWebhookReceipt(db.Model):
     event_type = db.Column(db.String(60), nullable=False)
     received_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
+
+class RevokedToken(db.Model):
+    __tablename__ = 'revoked_tokens'
+    jti = db.Column(db.String(36), primary_key=True)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    revoked_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
+class AuditLog(db.Model):
+    __tablename__ = 'audit_logs'
+    id = db.Column(db.Integer, primary_key=True)
+    actor_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True, index=True)
+    issue_id = db.Column(db.Integer, db.ForeignKey('issues.id'), nullable=True, index=True)
+    action = db.Column(db.String(80), nullable=False)
+    details = db.Column(db.Text, nullable=False, default='')
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
+@jwt.token_in_blocklist_loader
+def token_is_revoked(_jwt_header, jwt_payload):
+    return db.session.get(RevokedToken, jwt_payload['jti']) is not None
+
 EMAIL_EVENT_LABELS = {
     'created': 'New complaint',
     'assigned': 'Department assignment',
@@ -297,8 +460,7 @@ def build_email_payload(issue, event, recipient):
                 'content': base64.b64encode(uploaded.content).decode('ascii'),
                 'content_type': uploaded.mimetype,
             })
-        absolute_image_url = html.escape(absolute_app_url(image_url), quote=True)
-        images.append(f'<p><b>{html.escape(label_text)}:</b><br><a href="{absolute_image_url}">{absolute_image_url}</a></p>')
+        images.append(f'<p><b>{html.escape(label_text)}:</b> {html.escape(filename)} is attached to this email.</p>')
 
     subject = f'UrbanPulse {label}: {report_id} — {location}'
     body = (
@@ -427,53 +589,120 @@ def internal_error(error):
     return jsonify({'error': 'Internal server error'}), 500
 
 
+@app.errorhandler(413)
+def request_too_large(_error):
+    return jsonify({'success': False, 'error': 'Request exceeds the 12 MB limit.'}), 413
+
+
+@app.errorhandler(429)
+def rate_limit_exceeded(_error):
+    return jsonify({'success': False, 'error': 'Too many requests. Please try again later.'}), 429
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'DENY')
+    response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
+    response.headers.setdefault('Permissions-Policy', 'camera=(self), geolocation=(self)')
+    return response
+
+
+@app.route('/api/auth/register', methods=['POST'])
+@limiter.limit('5 per hour')
+def register_citizen():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get('username') or '').strip()
+    email = str(data.get('email') or '').strip().lower()
+    password = data.get('password')
+    if len(username) < 3 or len(username) > 80 or len(email) > 120 or '@' not in email:
+        return jsonify({'success': False, 'error': 'Provide a valid username and email address.'}), 400
+    if not isinstance(password, str) or len(password) < 12 or len(password) > 256:
+        return jsonify({'success': False, 'error': 'Password must contain 12 to 256 characters.'}), 400
+    if User.query.filter(or_(User.username == username, User.email == email)).first():
+        return jsonify({'success': False, 'error': 'Username or email is already registered.'}), 409
+    user = User(username=username, email=email, password_hash=generate_password_hash(password), role='citizen')
+    db.session.add(user)
+    db.session.commit()
+    token = create_access_token(identity=str(user.id), additional_claims={'role': user.role})
+    return jsonify({'success': True, 'access_token': token, 'user': {
+        'id': user.id, 'username': user.username, 'role': user.role,
+    }}), 201
+
+
+@app.route('/api/auth/register-department', methods=['POST'])
+@limiter.limit('5 per hour')
+def register_department_user():
+    if not require_admin():
+        return jsonify({'success': False, 'error': 'Administrator authorization required.'}), 403
+    data = request.get_json(silent=True) or {}
+    username = str(data.get('username') or '').strip()
+    email = str(data.get('email') or '').strip().lower()
+    department = str(data.get('department') or '').strip()
+    password = data.get('password')
+    if not username or len(username) > 80 or '@' not in email or len(email) > 120 or not department or len(department) > 50:
+        return jsonify({'success': False, 'error': 'Valid username, email, and department are required.'}), 400
+    if not isinstance(password, str) or len(password) < 12 or len(password) > 256:
+        return jsonify({'success': False, 'error': 'Password must contain 12 to 256 characters.'}), 400
+    if User.query.filter(or_(User.username == username, User.email == email)).first():
+        return jsonify({'success': False, 'error': 'Username or email is already registered.'}), 409
+    user = User(username=username, email=email, password_hash=generate_password_hash(password),
+                role='department_officer', department=department)
+    db.session.add(user)
+    db.session.commit()
+    audit_action(None, 'department_user_created', f'{department}: {username}')
+    db.session.commit()
+    return jsonify({'success': True, 'user': {'id': user.id, 'username': user.username,
+                                               'role': user.role, 'department': user.department}}), 201
+
+
+@app.route('/api/auth/login', methods=['POST'])
+@limiter.limit('10 per minute')
+def login():
+    data = request.get_json(silent=True) or {}
+    identifier = str(data.get('username') or data.get('email') or '').strip()
+    password = data.get('password')
+    user = User.query.filter(or_(User.username == identifier, User.email == identifier)).first() if identifier else None
+    try:
+        password_matches = bool(user and isinstance(password, str) and check_password_hash(user.password_hash, password))
+    except (ValueError, TypeError):
+        password_matches = False
+    if not password_matches:
+        return jsonify({'success': False, 'error': 'Invalid username/email or password.'}), 401
+    token = create_access_token(identity=str(user.id), additional_claims={'role': user.role})
+    return jsonify({'success': True, 'access_token': token, 'user': {
+        'id': user.id, 'username': user.username, 'role': user.role, 'department': user.department,
+    }})
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+@jwt_required()
+def logout():
+    claims = get_jwt()
+    db.session.add(RevokedToken(
+        jti=claims['jti'],
+        expires_at=datetime.utcfromtimestamp(claims['exp']),
+    ))
+    db.session.commit()
+    return jsonify({'success': True, 'message': 'Signed out.'})
+
+
 # ============ HEALTH CHECK ============
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat(),
-        'database': 'connected'
-    })
-
-
-# ============ DEMO API ============
-
-def seed_demo_data():
-    """Remove only the exact sample issues from the previous demo seed."""
-    demo_titles = [
-        'Overflowing pothole cluster near Market Road',
-        'Smart signal overload at Tech Park junction',
-        'AI waste segregation alert',
-    ]
-    samples = Issue.query.filter(Issue.title.in_(demo_titles)).all()
-    changed = bool(samples)
-    if samples:
-        for sample in samples:
-            db.session.delete(sample)
-    traffic_manager = User.query.filter_by(username='traffic_manager', email='traffic@urbanai.local').first()
-    if traffic_manager and not Issue.query.filter_by(assigned_to=traffic_manager.id).first():
-        NotificationQueue.query.filter_by(recipient_id=traffic_manager.id).delete(synchronize_session=False)
-        db.session.delete(traffic_manager)
-        changed = True
-    if changed:
-        db.session.commit()
-
-
-DATABASE_READY = False
-
-@app.before_request
-def ensure_database_ready():
-    global DATABASE_READY
-    if not DATABASE_READY:
-        db.create_all()
-        issue_columns = {column['name'] for column in inspect(db.engine).get_columns('issues')}
-        if 'assigned_department' not in issue_columns:
-            db.session.execute(text('ALTER TABLE issues ADD COLUMN assigned_department VARCHAR(120)'))
-            db.session.commit()
-        seed_demo_data()
-        DATABASE_READY = True
+    optional_services = {
+        'resend': 'configured' if all(os.getenv(name) for name in ('RESEND_API_KEY', 'RESEND_FROM_EMAIL', 'APP_BASE_URL')) else 'not_configured',
+        'resend_webhook': 'configured' if os.getenv('RESEND_WEBHOOK_SECRET') else 'not_configured',
+    }
+    try:
+        db.session.execute(text('SELECT 1'))
+    except Exception:
+        db.session.rollback()
+        return jsonify({'status': 'unhealthy', 'timestamp': datetime.utcnow().isoformat(),
+                        'database': 'unavailable', 'optional_services': optional_services}), 503
+    return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat(),
+                    'database': 'connected', 'optional_services': optional_services})
 
 
 @app.route('/api/issues', methods=['GET'])
@@ -482,16 +711,43 @@ def get_issues():
     status = request.args.get('status')
 
     query = Issue.query
+    user = current_user()
+    if not require_admin() and user:
+        if user.role in {'manager', 'department_officer', 'worker'}:
+            query = query.filter(Issue.assigned_department == user.department)
+        elif user.role == 'citizen':
+            query = query.filter(Issue.created_by == user.id)
     if issue_type and issue_type != 'all':
         query = query.filter_by(issue_type=issue_type)
     if status and status != 'all':
         query = query.filter_by(status=status)
 
     issues = query.order_by(Issue.created_at.desc()).all()
-    return jsonify({'success': True, 'items': [issue.to_dict() for issue in issues]})
+    return jsonify({'success': True, 'items': [issue_dict_for_request(issue) for issue in issues]})
 
 @app.route('/api/uploads/<path:filename>')
 def uploaded_image(filename):
+    safe_filename = secure_filename(filename)
+    if not filename or safe_filename != filename or '/' in filename or '\\' in filename:
+        return jsonify({'error': 'Image not found'}), 404
+    report_path = f'/api/uploads/{filename}'
+    authorized = False
+    signed_access = request.args.get('access')
+    if signed_access:
+        try:
+            claims = URLSafeTimedSerializer(app.config['JWT_SECRET_KEY'], salt='urbanai-image-access').loads(signed_access, max_age=900)
+            issue = db.session.get(Issue, int(claims.get('issue_id', 0)))
+            authorized = bool(issue and claims.get('filename') == filename and report_path in {
+                issue.image_url, issue.completion_image_url,
+            })
+        except (BadSignature, SignatureExpired, TypeError, ValueError):
+            authorized = False
+    if not authorized:
+        user = current_user()
+        linked_issues = Issue.query.filter(or_(Issue.image_url == report_path, Issue.completion_image_url == report_path)).all()
+        authorized = require_admin() or any(can_access_issue(issue, user) for issue in linked_issues)
+    if not authorized:
+        return jsonify({'error': 'Image access is not authorized.'}), 403
     image = db.session.get(UploadedImage, filename)
     if image:
         return send_file(BytesIO(image.content), mimetype=image.mimetype, download_name=filename)
@@ -502,6 +758,7 @@ def uploaded_image(filename):
 
 
 @app.route('/api/issues', methods=['POST'])
+@limiter.limit('10 per hour')
 def create_issue():
     data = request.form if request.content_type and request.content_type.startswith('multipart/') else (request.get_json() or {})
     required = ['issue_type', 'description', 'geotag_address']
@@ -512,13 +769,22 @@ def create_issue():
     issue_type = data['issue_type']
     if issue_type not in {'pothole', 'waste'}:
         return jsonify({'success': False, 'error': 'Only pothole and waste reports are supported.'}), 400
+    description = data.get('description')
+    address = data.get('geotag_address')
+    if not isinstance(description, str) or not description.strip() or len(description) > 5000:
+        return jsonify({'success': False, 'error': 'Description must contain 1 to 5,000 characters.'}), 400
+    if not isinstance(address, str) or not address.strip() or len(address.strip()) > 255:
+        return jsonify({'success': False, 'error': 'Location must contain 1 to 255 characters.'}), 400
+    category = str(data.get('category') or 'Pothole report').strip()
+    if issue_type == 'waste' and (not category or len(category) > 200):
+        return jsonify({'success': False, 'error': 'Waste category must contain 1 to 200 characters.'}), 400
     try:
-        image_url = save_uploaded_image(request.files.get('image')) if request.files else (data.get('image_url') or '')
+        image_url = save_uploaded_image(request.files.get('image')) if request.files else accept_existing_image_url(data.get('image_url'))
     except ValueError as error:
         return jsonify({'success': False, 'error': str(error)}), 400
     if not image_url:
         return jsonify({'success': False, 'error': 'A report photograph is required.'}), 400
-    address = data['geotag_address'].strip()
+    address = address.strip()
     try:
         latitude = float(data.get('latitude') or 0)
         longitude = float(data.get('longitude') or 0)
@@ -527,10 +793,11 @@ def create_issue():
     if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
         return jsonify({'success': False, 'error': 'GPS coordinates are outside the valid range.'}), 400
 
+    user = current_user()
     issue = Issue(
         issue_type=issue_type,
-        title=(data.get('category') or 'Pothole report') if issue_type == 'waste' else 'Pothole report',
-        description=data['description'],
+        title=category if issue_type == 'waste' else 'Pothole report',
+        description=description.strip(),
         latitude=latitude,
         longitude=longitude,
         geotag_address=address,
@@ -538,28 +805,34 @@ def create_issue():
         severity=5,
         status='new_report',
         image_url=image_url,
+        created_by=user.id if user else None,
     )
     db.session.add(issue)
+    db.session.commit()
+    audit_action(issue.id, 'complaint_submitted', issue.issue_type)
     db.session.commit()
     notify_issue_by_email(issue, 'created')
     db.session.commit()
     email_statuses = [row.status for row in EmailDelivery.query.filter_by(issue_id=issue.id, email_type='created').all()]
-    return jsonify({'success': True, 'issue': issue.to_dict(), 'email_statuses': email_statuses}), 201
+    return jsonify({'success': True, 'issue': issue_dict_for_request(issue), 'email_statuses': email_statuses}), 201
 
 
 @app.route('/api/issues/<int:issue_id>/complete', methods=['POST'])
 def complete_issue(issue_id):
+    if not can_manage_any_issue():
+        return jsonify({'success': False, 'error': 'Administrator or department officer authorization required.'}), 403
     issue = Issue.query.get_or_404(issue_id)
-    if not require_admin():
-        return jsonify({'success': False, 'error': 'Administrator key required.'}), 403
+    if not can_manage_issue(issue):
+        return jsonify({'success': False, 'error': 'Administrator or assigned department authorization required.'}), 403
     data = request.form if request.content_type and request.content_type.startswith('multipart/') else (request.get_json() or {})
     if issue.status == 'completed':
         return jsonify({'success': False, 'error': 'This report is already completed.'}), 409
     try:
-        after_image = save_uploaded_image(request.files.get('image')) if request.files else (data.get('completion_image_url') or '')
+        after_image = save_uploaded_image(request.files.get('image')) if request.files else accept_existing_image_url(data.get('completion_image_url'))
     except ValueError as error:
         return jsonify({'success': False, 'error': str(error)}), 400
-    if not after_image or not data.get('update_text', '').strip():
+    update_text = data.get('update_text')
+    if not after_image or not isinstance(update_text, str) or not update_text.strip() or len(update_text) > 2000:
         return jsonify({'success': False, 'error': 'After photo and completion details are required.'}), 400
 
     issue.status = 'completed'
@@ -568,28 +841,33 @@ def complete_issue(issue_id):
 
     db.session.add(IssueUpdate(
         issue_id=issue.id,
-        update_text=data['update_text'].strip(),
+        updated_by=(current_user().id if current_user() else None),
+        update_text=update_text.strip(),
         image_url=issue.completion_image_url,
     ))
+    audit_action(issue.id, 'work_completed', update_text.strip())
     db.session.commit()
     notify_issue_by_email(issue, 'completed')
     db.session.commit()
-    return jsonify({'success': True, 'issue': issue.to_dict()})
+    return jsonify({'success': True, 'issue': issue_dict_for_request(issue)})
 
 @app.route('/api/issues/<int:issue_id>/status', methods=['PATCH'])
 def update_issue_status(issue_id):
-    if not require_admin():
-        return jsonify({'success': False, 'error': 'Administrator key required.'}), 403
+    if not can_manage_any_issue():
+        return jsonify({'success': False, 'error': 'Administrator or department officer authorization required.'}), 403
     issue = Issue.query.get_or_404(issue_id)
+    if not can_manage_issue(issue):
+        return jsonify({'success': False, 'error': 'Administrator or assigned department authorization required.'}), 403
     status = (request.get_json() or {}).get('status')
     if status not in {'pending', 'in_progress'}:
         return jsonify({'success': False, 'error': 'Choose pending or in_progress; completion requires an after photo.'}), 400
     previous_status = issue.status
     issue.status = status
+    audit_action(issue.id, 'status_changed', f'{previous_status} -> {status}')
     db.session.commit()
     if status == 'in_progress' and previous_status != 'in_progress':
         notify_issue_by_email(issue, 'in_progress')
-    return jsonify({'success': True, 'issue': issue.to_dict()})
+    return jsonify({'success': True, 'issue': issue_dict_for_request(issue)})
 
 @app.route('/api/issues/<int:issue_id>/assign', methods=['POST'])
 def assign_issue(issue_id):
@@ -605,14 +883,15 @@ def assign_issue(issue_id):
     issue.assigned_at = datetime.utcnow()
     if issue.status in {'new_report', 'pending'}:
         issue.status = 'assigned'
+    audit_action(issue.id, 'department_assigned', department)
     db.session.commit()
     department_email = os.getenv('DEPARTMENT_EMAIL', '').strip()
     notify_issue_by_email(issue, 'assigned', [department_email] if department_email else [])
     if not department_email:
         # Persist the assignment; email configuration is tracked separately and
         # cannot make the complaint itself fail.
-        return jsonify({'success': True, 'issue': issue.to_dict(), 'email_status': 'not_configured'}), 200
-    return jsonify({'success': True, 'issue': issue.to_dict()}), 200
+        return jsonify({'success': True, 'issue': issue_dict_for_request(issue), 'email_status': 'not_configured'}), 200
+    return jsonify({'success': True, 'issue': issue_dict_for_request(issue)}), 200
 
 @app.route('/api/email/status', methods=['GET'])
 def email_status():
@@ -634,6 +913,18 @@ def email_status():
             'attempt_count': row.attempt_count, 'error': row.error,
         } for row in rows],
     })
+
+
+@app.route('/api/admin/audit', methods=['GET'])
+def audit_log():
+    if not require_admin():
+        return jsonify({'success': False, 'error': 'Administrator authorization required.'}), 403
+    rows = AuditLog.query.order_by(AuditLog.created_at.desc()).limit(200).all()
+    return jsonify({'success': True, 'items': [{
+        'id': row.id, 'actor_id': row.actor_id, 'issue_id': row.issue_id,
+        'action': row.action, 'details': row.details,
+        'created_at': row.created_at.isoformat() if row.created_at else None,
+    } for row in rows]})
 
 @app.route('/api/email/retry/<int:delivery_id>', methods=['POST'])
 def retry_email(delivery_id):
@@ -705,23 +996,24 @@ def resend_webhook():
 
 @app.route('/api/issues/<int:issue_id>/escalate', methods=['POST'])
 def escalate_issue(issue_id):
+    if not can_manage_any_issue():
+        return jsonify({'success': False, 'error': 'Administrator or department officer authorization required.'}), 403
     issue = Issue.query.get_or_404(issue_id)
+    if not can_manage_issue(issue):
+        return jsonify({'success': False, 'error': 'Administrator or assigned department authorization required.'}), 403
     issue.escalation_level = min(issue.escalation_level + 1, 5)
-    issue.escalation_status = 'social_media' if issue.escalation_level >= 5 else 'escalated'
+    issue.escalation_status = 'escalated'
     issue.escalation_date = datetime.utcnow()
-
-    if issue.escalation_level >= 5:
-        issue.social_media_posted = True
-        issue.social_media_url = f'https://social.example.com/urbanai/issues/{issue.id}'
 
     db.session.add(EscalationLog(
         issue_id=issue.id,
         escalation_level=issue.escalation_level,
-        action_taken='Auto escalation triggered from public dashboard',
+        action_taken='Escalation requested by an authorized administrator',
         escalation_type=issue.escalation_status,
     ))
+    audit_action(issue.id, 'complaint_escalated', f'Level {issue.escalation_level}')
     db.session.commit()
-    return jsonify({'success': True, 'issue': issue.to_dict()})
+    return jsonify({'success': True, 'issue': issue_dict_for_request(issue)})
 
 
 @app.route('/api/stats', methods=['GET'])
@@ -742,52 +1034,22 @@ def get_stats():
 
 # ============ DATABASE INITIALIZATION ============
 
-@app.cli.command()
-def init_db():
-    """Initialize the database"""
-    db.create_all()
-    print("Database initialized successfully!")
-
-
-@app.cli.command()
-def seed_db():
-    """Seed database with sample data"""
-    # Create sample users
-    admin = User(
-        username='admin',
-        email='admin@urban-ai.com',
-        password_hash='hashed_password',
-        role='admin'
-    )
-    
-    pothole_manager = User(
-        username='pothole_manager',
-        email='pothole@urban-ai.com',
-        password_hash='hashed_password',
-        role='manager',
-        department='pothole_repair',
-        phone='555-0001'
-    )
-    
-    waste_manager = User(
-        username='waste_manager',
-        email='waste@urban-ai.com',
-        password_hash='hashed_password',
-        role='manager',
-        department='waste_collection',
-        phone='555-0003'
-    )
-    
-    citizen = User(
-        username='citizen_001',
-        email='citizen@example.com',
-        password_hash='hashed_password',
-        role='citizen'
-    )
-    
-    db.session.add_all([admin, pothole_manager, waste_manager, citizen])
+@app.cli.command('create-admin')
+def create_admin():
+    """Create a real admin account with an interactively entered password."""
+    username = input('Admin username: ').strip()
+    email = input('Admin email: ').strip().lower()
+    password = getpass('Admin password (minimum 12 characters): ')
+    if len(password) < 12:
+        raise SystemExit('Password must contain at least 12 characters.')
+    if not username or not email:
+        raise SystemExit('Username and email are required.')
+    if User.query.filter(or_(User.username == username, User.email == email)).first():
+        raise SystemExit('That username or email already exists.')
+    user = User(username=username, email=email, password_hash=generate_password_hash(password), role='admin')
+    db.session.add(user)
     db.session.commit()
-    print("Database seeded with sample users!")
+    print(f'Administrator {username} created.')
 
 FRONTEND_BUILD = Path(__file__).resolve().parent.parent / 'frontend' / 'build'
 
@@ -804,4 +1066,4 @@ def frontend_app(path):
 
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=os.getenv('FLASK_DEBUG') == '1' and os.getenv('FLASK_ENV', '').lower() != 'production', host='0.0.0.0', port=5000)

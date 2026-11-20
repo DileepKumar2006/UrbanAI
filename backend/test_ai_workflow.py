@@ -89,7 +89,8 @@ class AIWorkflowTest(unittest.TestCase):
         self.assertEqual(analysis.predicted_category, 'Water Leakage')
         self.assertEqual(issue.confirmed_category, 'Pothole / Road Damage')
         self.assertEqual(submitted.get_json()['issue']['recommended_department'], 'Public Works Department')
-        self.assertIsNone(issue.assigned_department)
+        self.assertEqual(issue.assigned_department, 'Public Works Department')
+        self.assertEqual(issue.status, 'assigned')
         self.assertTrue(analysis.review_required)
 
     def test_mismatched_prediction_does_not_reject_report_and_queues_review(self):
@@ -133,6 +134,7 @@ class AIWorkflowTest(unittest.TestCase):
         corrected = self.client.patch(f'/api/issues/{issue_id}/category', json={'category': 'Water Leakage'}, headers={'Authorization': f'Bearer {token}'})
         self.assertEqual(corrected.status_code, 200)
         self.assertEqual(Issue.query.get(issue_id).confirmed_category, 'Water Leakage')
+        self.assertEqual(Issue.query.get(issue_id).assigned_department, 'Water Supply Department')
         self.assertEqual(AIAnalysis.query.one().predicted_category, 'Water Leakage')
         queue = self.client.get('/api/admin/ai-review', headers=self.admin)
         self.assertEqual(queue.status_code, 200)

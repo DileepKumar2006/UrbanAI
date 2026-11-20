@@ -592,6 +592,10 @@ def notify_issue_by_email(issue, event, recipient_list=None):
         recipients = [os.getenv('ADMIN_EMAIL', 'dk142252@gmail.com').strip(), os.getenv('DEPARTMENT_EMAIL', '').strip()]
     else:
         recipients = recipient_list
+    # Citizens who own a report receive the same persisted status events. Email
+    # delivery remains best-effort and cannot affect the complaint transaction.
+    if issue.creator and issue.creator.email:
+        recipients = [*recipients, issue.creator.email]
     recipients = list(dict.fromkeys(address.lower() for address in recipients if address and address.strip()))
     for recipient in recipients:
         delivery = EmailDelivery.query.filter_by(issue_id=issue.id, recipient_email=recipient, email_type=event).first()
@@ -1047,12 +1051,17 @@ def create_issue():
         geotag_address=address,
         area_name=data.get('area_name', ''),
         severity=5,
-        status='new_report',
+        status='assigned' if recommended_department(confirmed_category) else 'new_report',
         image_url=image_url,
         created_by=user.id if user else None,
+        assigned_department=recommended_department(confirmed_category),
+        assigned_at=datetime.utcnow() if recommended_department(confirmed_category) else None,
     )
     db.session.add(issue)
     db.session.commit()
+    if issue.assigned_department:
+        audit_action(issue.id, 'department_auto_assigned', f'{confirmed_category} -> {issue.assigned_department} (citizen-confirmed category)')
+        db.session.commit()
     image_filename = image_url.removeprefix('/api/uploads/') if image_url else ''
     stored_image = db.session.get(UploadedImage, image_filename) if image_filename else None
     image_bytes = stored_image.content if stored_image else b''
@@ -1118,9 +1127,18 @@ def correct_issue_category(issue_id):
     if category not in COMPLAINT_CATEGORIES:
         return jsonify({'success': False, 'error': 'Choose a valid complaint category.'}), 400
     previous = issue.confirmed_category
+    previous_recommendation = recommended_department(previous)
     issue.confirmed_category = category
     issue.title = category
     issue.issue_type = issue_type_for_category(category)
+    if issue.assigned_department == previous_recommendation:
+        next_department = recommended_department(category)
+        issue.assigned_department = next_department
+        issue.assigned_at = datetime.utcnow() if next_department else None
+        if issue.status == 'assigned' and not next_department:
+            issue.status = 'new_report'
+        elif issue.status == 'new_report' and next_department:
+            issue.status = 'assigned'
     analysis = AIAnalysis.query.filter_by(issue_id=issue.id).order_by(AIAnalysis.created_at.desc()).first()
     if analysis:
         analysis.confirmed_category = category
@@ -1141,9 +1159,18 @@ def review_issue_classification(issue_id):
     if not analysis:
         return jsonify({'success': False, 'error': 'No AI analysis is recorded for this complaint.'}), 404
     previous = issue.confirmed_category
+    previous_recommendation = recommended_department(previous)
     issue.confirmed_category = category
     issue.title = category
     issue.issue_type = issue_type_for_category(category)
+    if issue.assigned_department == previous_recommendation:
+        next_department = recommended_department(category)
+        issue.assigned_department = next_department
+        issue.assigned_at = datetime.utcnow() if next_department else None
+        if issue.status == 'assigned' and not next_department:
+            issue.status = 'new_report'
+        elif issue.status == 'new_report' and next_department:
+            issue.status = 'assigned'
     analysis.confirmed_category = category
     analysis.reviewed_category = category
     analysis.processing_status = 'reviewed'
@@ -1224,7 +1251,10 @@ def assign_issue(issue_id):
     audit_action(issue.id, 'department_assigned', department)
     db.session.commit()
     department_email = os.getenv('DEPARTMENT_EMAIL', '').strip()
-    notify_issue_by_email(issue, 'assigned', [department_email] if department_email else [])
+    recipients = [department_email] if department_email else []
+    if issue.creator and issue.creator.email:
+        recipients.append(issue.creator.email)
+    notify_issue_by_email(issue, 'assigned', recipients)
     if not department_email:
         # Persist the assignment; email configuration is tracked separately and
         # cannot make the complaint itself fail.
@@ -1356,16 +1386,23 @@ def escalate_issue(issue_id):
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
-    issues = Issue.query.all()
+    if not require_admin():
+        return jsonify({'success': False, 'error': 'Administrator authorization required.'}), 403
+    total = Issue.query.count()
+    pending = Issue.query.filter(Issue.status.in_(['pending', 'new_report'])).count()
+    in_progress = Issue.query.filter_by(status='in_progress').count()
+    completed = Issue.query.filter_by(status='completed').count()
+    escalated = Issue.query.filter(Issue.escalation_level > 0).count()
+    social_media = Issue.query.filter_by(social_media_posted=True).count()
     return jsonify({
         'success': True,
         'stats': {
-            'total': len(issues),
-            'pending': len([issue for issue in issues if issue.status == 'pending']),
-            'in_progress': len([issue for issue in issues if issue.status == 'in_progress']),
-            'completed': len([issue for issue in issues if issue.status == 'completed']),
-            'escalated': len([issue for issue in issues if issue.escalation_level > 0]),
-            'social_media': len([issue for issue in issues if issue.social_media_posted]),
+            'total': total,
+            'pending': pending,
+            'in_progress': in_progress,
+            'completed': completed,
+            'escalated': escalated,
+            'social_media': social_media,
         }
     })
 

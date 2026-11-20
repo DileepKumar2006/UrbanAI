@@ -216,6 +216,53 @@ class ComplaintEmailWorkflowTest(unittest.TestCase):
         self.assertEqual(logout.status_code, 200)
         self.assertEqual(self.client.get('/api/issues', headers=headers).get_json()['items'][0].get('description'), None)
 
+    def test_end_to_end_citizen_report_assignment_progress_and_completion(self):
+        signup = self.client.post('/api/auth/register', json={
+            'username': 'workflow-citizen', 'email': 'workflow@example.com',
+            'password': 'long-workflow-password',
+        })
+        self.assertEqual(signup.status_code, 201)
+        citizen_headers = {'Authorization': f"Bearer {signup.get_json()['access_token']}"}
+        submitted = self.submit_report('pothole', headers=citizen_headers)
+        self.assertEqual(submitted.status_code, 201)
+        report = submitted.get_json()['issue']
+        issue_id = report['id']
+        self.assertEqual(report['status'], 'assigned')
+        self.assertEqual(report['assigned_department'], 'Public Works Department')
+        self.assertEqual(EmailDelivery.query.filter_by(issue_id=issue_id, email_type='created').count(), 3)
+        self.assertTrue(EmailDelivery.query.filter_by(
+            issue_id=issue_id, email_type='created', recipient_email='workflow@example.com').first())
+
+        public_map = self.client.get('/api/map/issues').get_json()['items']
+        self.assertTrue(any(item['id'] == issue_id and item['location_approximate'] for item in public_map))
+        admin_headers = {'X-Admin-Key': 'test-admin-key'}
+        assigned = self.client.post(f'/api/issues/{issue_id}/assign',
+            json={'department': 'Roads Department'}, headers=admin_headers)
+        self.assertEqual(assigned.status_code, 200)
+        progress = self.client.patch(f'/api/issues/{issue_id}/status',
+            json={'status': 'in_progress'}, headers=admin_headers)
+        self.assertEqual(progress.status_code, 200)
+        self.assertTrue(EmailDelivery.query.filter_by(
+            issue_id=issue_id, email_type='in_progress', recipient_email='workflow@example.com').first())
+        completion = self.client.post(f'/api/issues/{issue_id}/complete', data={
+            'update_text': 'Pothole repair completed.',
+            'image': (self.jpeg(), 'after.jpg', 'image/jpeg'),
+        }, headers=admin_headers, content_type='multipart/form-data')
+        self.assertEqual(completion.status_code, 200)
+        citizen_reports = self.client.get('/api/issues', headers=citizen_headers).get_json()['items']
+        self.assertEqual(len(citizen_reports), 1)
+        self.assertEqual(citizen_reports[0]['status'], 'completed')
+        self.assertTrue(citizen_reports[0]['completion_image_url'])
+        self.assertTrue(EmailDelivery.query.filter_by(
+            issue_id=issue_id, email_type='completed', recipient_email='workflow@example.com').first())
+
+    def test_stats_are_admin_only_and_use_database_aggregates(self):
+        self.submit_report('pothole')
+        self.assertEqual(self.client.get('/api/stats').status_code, 403)
+        response = self.client.get('/api/stats', headers={'X-Admin-Key': 'test-admin-key'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['stats']['total'], 1)
+
     def test_invalid_login_and_database_health(self):
         denied = self.client.post('/api/auth/login', json={
             'username': 'missing-user', 'password': 'invalid-password',

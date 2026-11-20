@@ -15,7 +15,7 @@ The frontend can point to another backend with `REACT_APP_API_URL` before starti
 
 ### AI image classification (optional)
 
-The complaint form requests an advisory prediction after a photo is selected. It shows confidence, model version, and review state; the user still selects the confirmed category, and AI downtime never blocks reporting. The backend signs predictions against the image hash, stores predictions separately from the confirmed complaint category, and exposes an administrator review queue. The confirmed category produces a recommended department hint; it does not automatically assign the complaint. Existing administrator/department assignment behavior remains manual because this branch does not contain the Phase 2 workload-routing engine.
+The complaint form requests an advisory prediction after a photo is selected. It shows confidence, model version, and review state; the user still selects the confirmed category, and AI downtime never blocks reporting. The backend signs predictions against the image hash, stores predictions separately from the confirmed complaint category, and exposes an administrator review queue. Department routing uses only the citizen-confirmed category, never an unconfirmed AI prediction. The category map in `backend/ai/categories.py` assigns a department on report creation and re-routes it when the confirmed category changes, provided the current assignment still matches the previous category's automatic route. Administrators can manually override the route. This is a static category mapping, not the Phase 2 department registry/workload engine: department CRUD, editable mappings, workload balancing, assignment history, department-specific email routing, and automatic overdue escalation are not implemented.
 
 The current repository contains a MobileNetV3-Small transfer-learning pipeline, but no trained UrbanAI weights or evaluation metrics. Install `backend/requirements-ai.txt` for optional local ML dependencies. Follow [the dataset preparation guide](backend/ai/dataset/README.md), gather reviewed/licensed labeled examples for each of the seven categories, prepare deterministic splits, then train with `python -m ai.train --data artifacts/dataset-splits --output ai/models` from `backend`. Actual evaluation metrics are saved to `backend/ai/models/evaluation.json`; model weights are git-ignored. Do not use supplied reference photos as a training dataset without explicit permission and proper labels.
 
@@ -77,7 +77,7 @@ Configure these **backend** environment variables (never put the API key in Reac
 - `APP_BASE_URL`: public UrbanPulse URL used for complaint and photograph links.
 - `RESEND_WEBHOOK_SECRET`: signing secret for the Resend webhook (recommended for delivery tracking).
 
-The backend sends new complaint emails to the admin and configured department, assignment email to the department, and Work in Progress/completion emails to both. Complaint photos and after-repair photos are attached when present, and each message includes the original complaint link. Email failures do not roll back or hide complaints. Each recipient/event is logged in `email_deliveries`; Resend acceptance is recorded as `accepted`, and only a verified `email.delivered` webhook sets `delivered`. Bounces, provider failures, delayed delivery and complaints update that log as well. Administrators can inspect deliveries and retry determinate failures in Settings; retries use a stable Resend idempotency key and are limited to the provider's 24-hour idempotency window.
+The backend sends new complaint emails to the admin and configured department, assignment email to the department, and Work in Progress/completion emails to both. Registered citizens who own a report are also included for creation, assignment, progress, and completion events; anonymous reports have no owner recipient. Complaint photos and after-repair photos are attached when present, and each message includes the original complaint link. Email failures do not roll back or hide complaints. Each recipient/event is logged in `email_deliveries`; Resend acceptance is recorded as `accepted`, and only a verified `email.delivered` webhook sets `delivered`. Bounces, provider failures, delayed delivery and complaints update that log as well. Administrators can inspect deliveries and retry determinate failures in Settings; retries use a stable Resend idempotency key and are limited to the provider's 24-hour idempotency window.
 
 In Resend, verify the sender domain, create a webhook for `https://YOUR-APP-URL/api/email/webhook`, select `email.sent`, `email.delivered`, `email.delivery_delayed`, `email.failed`, `email.bounced`, and `email.complained`, then save its signing secret as `RESEND_WEBHOOK_SECRET`. Resend documents idempotency keys for duplicate-safe sends and webhooks for delivery events: [Idempotency keys](https://resend.com/changelog/idempotency-keys), [webhooks](https://resend.com/features/webhooks).
 
@@ -89,6 +89,56 @@ Reports, status, completion updates, uploaded image bytes, email delivery record
 
 The three supplied road photographs are in `frontend/public/reference-photos` and appear only as reference examples; they are not fabricated reports. The database is no longer seeded with sample issue records.
 
+## Architecture and API map
+
+The deployed service is a single Docker image: React is built in the Node stage and served by Flask/Gunicorn alongside the JSON API. PostgreSQL is the production database; SQLAlchemy models, route handlers, email delivery, authorization, and most business logic currently live together in `backend/app.py`. `backend/ai/` contains the optional training and inference pipeline, `backend/migrations/` contains additive Alembic revisions, and `backend/test_*.py` contains API and workflow tests. `frontend/src/components/Dashboard.jsx` is the main citizen/administrator interface; `IssueMap.jsx` is the map view and `App.css` contains shared styles. Older page, route, service, and model modules remain in the repository but are not the active API implementation.
+
+Main API routes:
+
+- `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/logout`: citizen account and session lifecycle.
+- `POST /api/issues`: validates and stores a report/photo, category, geotag, optional AI record, confirmed-category routing, audit event, and email delivery records.
+- `GET /api/issues`: report list scoped to public, citizen, department, or administrator access.
+- `PATCH /api/issues/<id>/category`, `PATCH /api/issues/<id>/ai-review`, `GET /api/admin/ai-review`: citizen correction and administrator AI review.
+- `POST /api/issues/<id>/assign`, `PATCH /api/issues/<id>/status`, `POST /api/issues/<id>/complete`: department assignment, progress, and completion on the original report.
+- `GET /api/map/issues`: paged/filterable map records with public coordinate masking.
+- `GET /api/stats`: database-side aggregate counts, administrator-only.
+- `GET /api/email/status`, `POST /api/email/retry/<id>`, `POST /api/email/webhook`: delivery tracking, controlled retry, and signed provider events.
+- `GET /api/health`: database health and optional email/webhook configuration flags.
+
+## Phase 5 integration and verification
+
+These checks used isolated test databases and mocked Resend requests; no production complaint records or live email credentials were used:
+
+- Backend: 25 tests passed, including registration, citizen ownership, image validation, confirmed-category assignment, administrator reassignment, citizen progress/completion email records, same-report after-photo history, public map masking, delivery webhook, duplicate prevention, failed delivery persistence, escalation authorization, and database health.
+- Frontend: 5 tests passed across dashboard/account controls, citizen registration, map rendering, filters, and privacy behavior.
+- Frontend production build: `npm run build` succeeded.
+- Restore/migration rehearsal: a temporary copy of the local Phase 1 backup passed SQLite integrity checks, upgraded through `0002_ai_classification`, and retained the existing issue/user row counts. This is not a restore test of the Render production database.
+- Email tests mocked Resend acceptance and signed webhook callbacks; they did not send or verify real email delivery.
+- `npm audit --omit=dev` could not reach the npm registry because DNS resolution failed, so current frontend advisory status was not verified. Do not infer that the dependencies are clear.
+- Docker is not installed in this workspace. The local Windows host also cannot launch Gunicorn because Gunicorn requires Unix `fcntl`; the Flask test client, Python compilation, and frontend build passed, but a Linux container build/startup remains unverified here.
+
+### Phase 1–4 readiness checklist
+
+| Area | Status | Evidence / remaining work |
+| --- | --- | --- |
+| Phase 1 security and persistence | Implemented and tested; production checks remain | Password hashing, JWT revocation, role/ownership scopes, image validation, audit events, explicit migrations, Postgres configuration, rate limits and email logs exist. Production secrets, backup/restore and provider settings require deployment-owner verification. |
+| Phase 2 department management | Incomplete | Static confirmed-category routing and manual override are integrated. Department registry/CRUD, editable mappings, workload balancing, assignment history, department-specific email recipients and overdue auto-escalation are absent. |
+| Phase 3 image classification | Implemented but unavailable without model assets | Inference and review paths handle missing models safely; no trained UrbanAI weights, reviewed dataset, or measured evaluation results are present. |
+| Phase 4 interactive map | Implemented and tested | API-backed markers, filters, clustering/density, paging, missing-coordinate handling and public coordinate masking are tested. Tile availability depends on the external provider. |
+| Email notifications | Implemented; live delivery unverified | Resend calls, provider IDs, idempotency, retries and signed webhook events are implemented. Real sender verification, recipients, webhook configuration and inbox verification remain external setup tasks. |
+| Citizen/admin/department workflows | Implemented and tested for covered paths | Citizen registration/ownership, administrator management, department-scoped work, report history and completion are covered. The dashboard's report feed is polled for updates; `NotificationQueue` is not an active notification service. |
+| Escalation | Partially implemented | Authorized manual escalation and audit history exist; no scheduled SLA/overdue escalation job or escalation email event exists. |
+
+The `/api/stats` route rejects unauthenticated requests and uses SQL count queries instead of loading every complaint into Python memory. Department assignment is triggered by confirmed categories and can be manually overridden; an AI prediction alone never assigns a department.
+
+No performance benchmark or production PostgreSQL load test was run. The reports API currently returns all authorized reports in one response; use pagination before scaling to large datasets. Uploaded photographs are stored as PostgreSQL BLOBs, so storage, backup size, and transfer costs should be monitored. Rate limiting currently uses process-local memory; use shared Redis before scaling to multiple web instances.
+
 ## Deploy on Render
 
 In Render, create a Blueprint from `DileepKumar2006/UrbanAI` and select the `master` branch. Render reads the root `render.yaml`, builds the Docker image, and creates the web service and Postgres database. The blueprint uses free plans for a no-cost preview; its database is temporary and expires after 30 days. Choose a paid Postgres plan in Render before using it for durable citizen reports. After the service is live, open the generated `onrender.com` URL and use the generated `URBANPULSE_ADMIN_KEY` from the service environment in the app's Settings page.
+
+The free Render tier is preview-only for this application: free web services can sleep after 15 minutes idle and lose local files on restart/redeploy; free Postgres is 1 GB and expires after 30 days. UrbanPulse stores uploaded images in the database, so plan durable PostgreSQL capacity and backups before collecting real reports. Render currently lists paid web compute starting at $7/month and Postgres starting at $6/month; actual totals depend on service size, database storage, bandwidth, and plan changes. Verify current pricing before choosing a production plan: [Render pricing](https://render.com/pricing) and [free-tier limits](https://render.com/docs/free). No production environment variable, database, Render service, or deployment was changed during Phase 5.
+
+### Deployment readiness gate
+
+Before approving a production rollout: use a paid durable PostgreSQL plan; take and restore-test a fresh production backup; set a strong `JWT_SECRET_KEY` and admin key; configure the verified Resend sender, recipient addresses and webhook; decide whether untrained AI should remain disabled; configure shared rate-limit storage if scaling; build and launch the Docker image on Linux; run smoke tests against a staging database; verify logs, health checks, image access, and mail delivery; then explicitly approve deployment. These checks have not been performed against the live Render service.

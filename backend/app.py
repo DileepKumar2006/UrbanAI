@@ -20,7 +20,8 @@ from werkzeug.utils import secure_filename
 from io import BytesIO
 from pathlib import Path
 from dotenv import load_dotenv
-from sqlalchemy import Index, or_, text
+from sqlalchemy import Index, or_, and_, text, func
+from sqlalchemy.orm import selectinload
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
 from PIL import Image, UnidentifiedImageError
@@ -214,6 +215,7 @@ def issue_dict_for_request(issue):
         payload.pop('description', None)
         payload.pop('assigned_to', None)
         payload.pop('assigned_manager', None)
+        payload.pop('assigned_department', None)
         payload.pop('created_by', None)
         payload.pop('updates', None)
         payload.pop('escalation_level', None)
@@ -778,6 +780,146 @@ def get_issues():
 
     issues = query.order_by(Issue.created_at.desc()).all()
     return jsonify({'success': True, 'items': [issue_dict_for_request(issue) for issue in issues]})
+
+
+@app.route('/api/map/issues', methods=['GET'])
+@limiter.limit('120 per minute')
+def get_map_issues():
+    """Map-only report feed with public coordinate masking and bounded paging."""
+    user = current_user()
+    is_admin = require_admin()
+    query = Issue.query
+    if not is_admin and user:
+        if user.role in {'manager', 'department_officer', 'worker'}:
+            query = query.filter(Issue.assigned_department == user.department)
+        elif user.role == 'citizen':
+            query = query.filter(Issue.created_by == user.id)
+        else:
+            query = query.filter(Issue.id == -1)
+    department_scope = query
+
+    category = request.args.get('category', '').strip()
+    status = request.args.get('status', '').strip()
+    department = request.args.get('department', '').strip()
+    priority = request.args.get('priority', '').strip().lower()
+    search = request.args.get('search', '').strip()[:120]
+    if category and category != 'all':
+        query = query.filter(or_(Issue.confirmed_category == category, Issue.title == category))
+    if status and status != 'all':
+        if status not in {'new_report', 'pending', 'assigned', 'in_progress', 'completed'}:
+            return jsonify({'success': False, 'error': 'Invalid complaint status filter.'}), 400
+        query = query.filter(Issue.status == status)
+    if department and department != 'all':
+        query = query.filter(Issue.assigned_department.ilike(department))
+    if priority and priority != 'all':
+        if priority == 'high':
+            query = query.filter(Issue.severity >= 8)
+        elif priority == 'medium':
+            query = query.filter(Issue.severity.between(4, 7))
+        elif priority == 'low':
+            query = query.filter(Issue.severity <= 3)
+        else:
+            return jsonify({'success': False, 'error': 'Priority must be low, medium, or high.'}), 400
+    if search:
+        pattern = f'%{search}%'
+        search_fields = [Issue.title.ilike(pattern), Issue.confirmed_category.ilike(pattern), Issue.area_name.ilike(pattern)]
+        # Public requests may use private fields to narrow the result only for
+        # staff/owner contexts, never to reveal their values.
+        if is_admin or (user and user.role in {'manager', 'department_officer', 'worker', 'citizen'}):
+            search_fields.extend([Issue.description.ilike(pattern), Issue.geotag_address.ilike(pattern)])
+        query = query.filter(or_(*search_fields))
+
+    try:
+        date_from = request.args.get('date_from')
+        date_to = request.args.get('date_to')
+        if date_from:
+            query = query.filter(Issue.created_at >= datetime.combine(datetime.fromisoformat(date_from).date(), datetime.min.time()))
+        if date_to:
+            end_date = datetime.fromisoformat(date_to).date() + timedelta(days=1)
+            query = query.filter(Issue.created_at < datetime.combine(end_date, datetime.min.time()))
+    except ValueError:
+        return jsonify({'success': False, 'error': 'Dates must use YYYY-MM-DD format.'}), 400
+
+    missing_coordinate_query = query
+    bounds = request.args.get('bounds')
+    if bounds:
+        try:
+            south, west, north, east = [float(value) for value in bounds.split(',')]
+            if not (-90 <= south < north <= 90 and -180 <= west < east <= 180):
+                raise ValueError
+            if is_admin or user:
+                query = query.filter(Issue.latitude.between(south, north), Issue.longitude.between(west, east))
+            else:
+                # Public viewport queries must use the same coarse location
+                # precision as public marker output, avoiding a bbox probing
+                # side channel for recovering exact report coordinates.
+                query = query.filter(func.round(Issue.latitude, 2).between(south, north),
+                                     func.round(Issue.longitude, 2).between(west, east))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'Map bounds must be south,west,north,east decimal coordinates.'}), 400
+
+    missing_coordinates = missing_coordinate_query.filter(or_(
+        and_(Issue.latitude == 0, Issue.longitude == 0),
+        Issue.latitude < -90, Issue.latitude > 90,
+        Issue.longitude < -180, Issue.longitude > 180,
+    )).count()
+    query = query.filter(Issue.latitude.between(-90, 90), Issue.longitude.between(-180, 180),
+                         or_(Issue.latitude != 0, Issue.longitude != 0))
+    total = query.count()
+    hotspot_rows = query.with_entities(
+        (func.round(Issue.latitude * 50) / 50.0).label('latitude_cell'),
+        (func.round(Issue.longitude * 50) / 50.0).label('longitude_cell'),
+        func.count(Issue.id).label('report_count'),
+    ).group_by('latitude_cell', 'longitude_cell').order_by(func.count(Issue.id).desc()).limit(2000).all()
+    try:
+        limit = max(1, min(int(request.args.get('limit', 300)), 500))
+        offset = max(0, int(request.args.get('offset', 0)))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Pagination values must be integers.'}), 400
+    page_query = query.order_by(Issue.created_at.desc(), Issue.id.desc())
+    if is_admin or user:
+        page_query = page_query.options(selectinload(Issue.ai_analyses))
+    issues = page_query.offset(offset).limit(limit + 1).all()
+    has_more = len(issues) > limit
+    issues = issues[:limit]
+    items = []
+    for issue in issues:
+        authorized = is_admin or can_access_issue(issue, user)
+        latitude, longitude = issue.latitude, issue.longitude
+        if not authorized:
+            latitude, longitude = round(latitude, 2), round(longitude, 2)
+        analysis = issue.ai_analyses[-1] if authorized and issue.ai_analyses else None
+        category_value = issue.confirmed_category or (issue.title if issue.issue_type in {'waste', 'civic'} else 'Pothole / Road Damage')
+        items.append({
+            'id': issue.id,
+            'reference': f'UP-{issue.id:04d}',
+            'category': category_value,
+            'issue_type': issue.issue_type,
+            'status': issue.status,
+            'priority': 'high' if issue.severity >= 8 else 'low' if issue.severity <= 3 else 'medium',
+            'severity': issue.severity,
+            'created_at': issue.created_at.isoformat() if issue.created_at else None,
+            'latitude': latitude,
+            'longitude': longitude,
+            'location_approximate': not authorized,
+            'short_description': (issue.description[:180] if issue.description else '') if authorized else '',
+            'assigned_department': issue.assigned_department if authorized else None,
+            'ai_suggested_category': analysis.predicted_category if analysis else None,
+            'can_open_details': authorized,
+            'is_escalated': bool(issue.escalation_level or issue.escalation_status in {'escalated', 'social_media'}),
+        })
+    departments = []
+    if is_admin or (user and user.role in {'manager', 'department_officer', 'worker'}):
+        departments = [name for (name,) in department_scope.with_entities(Issue.assigned_department).filter(
+            Issue.assigned_department.isnot(None), Issue.assigned_department != ''
+        ).distinct().order_by(Issue.assigned_department).all()]
+    return jsonify({'success': True, 'items': items, 'total': total, 'limit': limit,
+                    'offset': offset, 'has_more': has_more,
+                    'missing_coordinates': missing_coordinates,
+                    'precise_coordinates': bool(is_admin or (user and user.role in {'citizen', 'manager', 'department_officer', 'worker'})),
+                    'departments': departments,
+                    'hotspots': [{'latitude': float(row.latitude_cell), 'longitude': float(row.longitude_cell),
+                                  'count': row.report_count} for row in hotspot_rows]})
 
 
 @app.route('/api/ai/classify', methods=['POST'])

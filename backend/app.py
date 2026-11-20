@@ -7,7 +7,8 @@ from flask import Flask, jsonify, request, send_from_directory, send_file, abort
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, get_jwt, get_jwt_identity, jwt_required, verify_jwt_in_request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import csv
 import os
 import requests
 import base64
@@ -21,7 +22,7 @@ from io import BytesIO
 from pathlib import Path
 from dotenv import load_dotenv
 from sqlalchemy import Index, or_, and_, text, func
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, deferred
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
 from PIL import Image, UnidentifiedImageError
@@ -454,6 +455,582 @@ class AuditLog(db.Model):
     action = db.Column(db.String(80), nullable=False)
     details = db.Column(db.Text, nullable=False, default='')
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
+class RoadSection(db.Model):
+    """A maintained road segment; separate from citizen complaint locations."""
+    __tablename__ = 'road_sections'
+    id = db.Column(db.Integer, primary_key=True)
+    section_code = db.Column(db.String(64), nullable=False, unique=True, index=True)
+    road_name = db.Column(db.String(200), nullable=False)
+    ward_zone = db.Column(db.String(120))
+    road_type = db.Column(db.String(80))
+    length_meters = db.Column(db.Float)
+    latitude = db.Column(db.Float)
+    longitude = db.Column(db.Float)
+    notes = db.Column(db.String(2000))
+    source = db.Column(db.String(255))
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    conditions = db.relationship('RoadConditionObservation', backref='road_section', lazy=True, cascade='all, delete-orphan')
+    inspections = db.relationship('RoadInspection', backref='road_section', lazy=True, cascade='all, delete-orphan')
+    weather_observations = db.relationship('RoadWeatherObservation', backref='road_section', lazy=True, cascade='all, delete-orphan')
+    traffic_observations = db.relationship('RoadTrafficObservation', backref='road_section', lazy=True, cascade='all, delete-orphan')
+    maintenance_records = db.relationship('RoadMaintenanceRecord', backref='road_section', lazy=True, cascade='all, delete-orphan')
+    images = db.relationship('RoadImage', backref='road_section', lazy=True, cascade='all, delete-orphan')
+    __table_args__ = (
+        db.CheckConstraint('length_meters IS NULL OR length_meters >= 0', name='ck_road_sections_length_nonnegative'),
+        db.CheckConstraint('(latitude IS NULL AND longitude IS NULL) OR (latitude IS NOT NULL AND longitude IS NOT NULL)',
+                           name='ck_road_sections_coordinate_pair'),
+    )
+
+
+class RoadConditionObservation(db.Model):
+    __tablename__ = 'road_condition_observations'
+    id = db.Column(db.Integer, primary_key=True)
+    road_section_id = db.Column(db.Integer, db.ForeignKey('road_sections.id'), nullable=False, index=True)
+    observed_at = db.Column(db.DateTime, nullable=False, index=True)
+    condition = db.Column(db.String(48), nullable=False)
+    severity = db.Column(db.Integer)
+    details = db.Column(db.String(2000))
+    source = db.Column(db.String(255), nullable=False)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    __table_args__ = (
+        db.CheckConstraint("condition IN ('healthy','minor_cracking','alligator_cracking','surface_wear','edge_deterioration','potholes','other')",
+                           name='ck_road_condition_category'),
+        db.CheckConstraint('severity IS NULL OR severity BETWEEN 1 AND 5', name='ck_road_condition_severity'),
+    )
+
+
+class RoadInspection(db.Model):
+    __tablename__ = 'road_inspections'
+    id = db.Column(db.Integer, primary_key=True)
+    road_section_id = db.Column(db.Integer, db.ForeignKey('road_sections.id'), nullable=False, index=True)
+    inspected_at = db.Column(db.DateTime, nullable=False, index=True)
+    inspector = db.Column(db.String(160))
+    findings = db.Column(db.String(2000), nullable=False)
+    recommended_action = db.Column(db.String(1000))
+    source = db.Column(db.String(255), nullable=False)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class RoadWeatherObservation(db.Model):
+    __tablename__ = 'road_weather_observations'
+    id = db.Column(db.Integer, primary_key=True)
+    road_section_id = db.Column(db.Integer, db.ForeignKey('road_sections.id'), nullable=False, index=True)
+    observed_at = db.Column(db.DateTime, nullable=False, index=True)
+    rainfall_mm = db.Column(db.Float)
+    temperature_c = db.Column(db.Float)
+    humidity_percent = db.Column(db.Float)
+    source = db.Column(db.String(255), nullable=False)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    __table_args__ = (
+        db.CheckConstraint('rainfall_mm IS NULL OR rainfall_mm >= 0', name='ck_road_weather_rainfall_nonnegative'),
+        db.CheckConstraint('humidity_percent IS NULL OR humidity_percent BETWEEN 0 AND 100', name='ck_road_weather_humidity_range'),
+    )
+
+
+class RoadTrafficObservation(db.Model):
+    __tablename__ = 'road_traffic_observations'
+    id = db.Column(db.Integer, primary_key=True)
+    road_section_id = db.Column(db.Integer, db.ForeignKey('road_sections.id'), nullable=False, index=True)
+    observed_at = db.Column(db.DateTime, nullable=False, index=True)
+    interval_minutes = db.Column(db.Integer)
+    vehicle_count = db.Column(db.Integer)
+    average_daily_traffic = db.Column(db.Integer)
+    heavy_vehicle_proportion = db.Column(db.Float)
+    peak_hour_vehicles = db.Column(db.Integer)
+    intensity_category = db.Column(db.String(24))
+    source = db.Column(db.String(255), nullable=False)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    __table_args__ = (
+        db.CheckConstraint('interval_minutes IS NULL OR interval_minutes BETWEEN 1 AND 1440', name='ck_road_traffic_interval'),
+        db.CheckConstraint('vehicle_count IS NULL OR vehicle_count >= 0', name='ck_road_traffic_count_nonnegative'),
+        db.CheckConstraint('average_daily_traffic IS NULL OR average_daily_traffic >= 0', name='ck_road_traffic_adt_nonnegative'),
+        db.CheckConstraint('peak_hour_vehicles IS NULL OR peak_hour_vehicles >= 0', name='ck_road_traffic_peak_nonnegative'),
+        db.CheckConstraint('heavy_vehicle_proportion IS NULL OR heavy_vehicle_proportion BETWEEN 0 AND 1', name='ck_road_traffic_heavy_ratio'),
+        db.CheckConstraint("intensity_category IS NULL OR intensity_category IN ('low','moderate','heavy')", name='ck_road_traffic_intensity'),
+    )
+
+
+class RoadMaintenanceRecord(db.Model):
+    __tablename__ = 'road_maintenance_records'
+    id = db.Column(db.Integer, primary_key=True)
+    road_section_id = db.Column(db.Integer, db.ForeignKey('road_sections.id'), nullable=False, index=True)
+    maintenance_date = db.Column(db.DateTime, nullable=False, index=True)
+    repair_type = db.Column(db.String(160), nullable=False)
+    cost = db.Column(db.Float)
+    notes = db.Column(db.String(2000))
+    source = db.Column(db.String(255), nullable=False)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    __table_args__ = (
+        db.CheckConstraint('cost IS NULL OR cost >= 0', name='ck_road_maintenance_cost_nonnegative'),
+    )
+
+
+class RoadImage(db.Model):
+    __tablename__ = 'road_images'
+    id = db.Column(db.Integer, primary_key=True)
+    road_section_id = db.Column(db.Integer, db.ForeignKey('road_sections.id'), nullable=False, index=True)
+    filename = db.Column(db.String(255), nullable=False)
+    original_name = db.Column(db.String(255), nullable=False)
+    mimetype = db.Column(db.String(80), nullable=False)
+    content = deferred(db.Column(db.LargeBinary, nullable=False))
+    captured_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    source = db.Column(db.String(255), nullable=False)
+    license_name = db.Column(db.String(160))
+    license_url = db.Column(db.String(500))
+    attribution = db.Column(db.String(500))
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+ROAD_CONDITIONS = {'healthy', 'minor_cracking', 'alligator_cracking', 'surface_wear', 'edge_deterioration', 'potholes', 'other'}
+TRAFFIC_INTENSITIES = {'low', 'moderate', 'heavy'}
+
+
+def road_data_authorized():
+    user = current_user()
+    return require_admin() or bool(user and user.role in {'manager', 'department_officer'} and user.department)
+
+
+def parse_road_datetime(value, field):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f'{field} is required.')
+    try:
+        result = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+    except ValueError:
+        raise ValueError(f'{field} must be an ISO date and time.')
+    if result.tzinfo:
+        result = result.astimezone(timezone.utc).replace(tzinfo=None)
+    return result
+
+
+def optional_road_number(value, field, minimum=None, maximum=None, integer=False):
+    if value in (None, ''):
+        return None
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        parsed = float(value)
+        if integer and not parsed.is_integer():
+            raise ValueError
+        number = int(parsed) if integer else parsed
+    except (TypeError, ValueError):
+        raise ValueError(f'{field} must be a valid number.')
+    if isinstance(number, float) and (number != number or number in (float('inf'), float('-inf'))):
+        raise ValueError(f'{field} must be a finite number.')
+    if minimum is not None and number < minimum or maximum is not None and number > maximum:
+        raise ValueError(f'{field} must be between {minimum} and {maximum}.')
+    return number
+
+
+def road_section_dict(section, detail=False):
+    result = {
+        'id': section.id, 'section_code': section.section_code, 'road_name': section.road_name,
+        'ward_zone': section.ward_zone, 'road_type': section.road_type,
+        'length_meters': section.length_meters, 'latitude': section.latitude,
+        'longitude': section.longitude, 'notes': section.notes, 'source': section.source,
+        'created_at': section.created_at.isoformat(), 'updated_at': section.updated_at.isoformat(),
+        'record_counts': {
+            'conditions': len(section.conditions), 'inspections': len(section.inspections),
+            'weather': len(section.weather_observations), 'traffic': len(section.traffic_observations),
+            'maintenance': len(section.maintenance_records), 'images': len(section.images),
+        },
+    }
+    if detail:
+        result.update({
+            'conditions': [{'id': row.id, 'observed_at': row.observed_at.isoformat(), 'condition': row.condition,
+                            'severity': row.severity, 'details': row.details, 'source': row.source}
+                           for row in sorted(section.conditions, key=lambda item: item.observed_at, reverse=True)],
+            'inspections': [{'id': row.id, 'inspected_at': row.inspected_at.isoformat(), 'inspector': row.inspector,
+                             'findings': row.findings, 'recommended_action': row.recommended_action, 'source': row.source}
+                            for row in sorted(section.inspections, key=lambda item: item.inspected_at, reverse=True)],
+            'weather_observations': [{'id': row.id, 'observed_at': row.observed_at.isoformat(), 'rainfall_mm': row.rainfall_mm,
+                                      'temperature_c': row.temperature_c, 'humidity_percent': row.humidity_percent, 'source': row.source}
+                                     for row in sorted(section.weather_observations, key=lambda item: item.observed_at, reverse=True)],
+            'traffic_observations': [{'id': row.id, 'observed_at': row.observed_at.isoformat(), 'interval_minutes': row.interval_minutes,
+                                      'vehicle_count': row.vehicle_count, 'average_daily_traffic': row.average_daily_traffic,
+                                      'heavy_vehicle_proportion': row.heavy_vehicle_proportion, 'peak_hour_vehicles': row.peak_hour_vehicles,
+                                      'intensity_category': row.intensity_category, 'source': row.source}
+                                     for row in sorted(section.traffic_observations, key=lambda item: item.observed_at, reverse=True)],
+            'maintenance_records': [{'id': row.id, 'maintenance_date': row.maintenance_date.isoformat(), 'repair_type': row.repair_type,
+                                     'cost': row.cost, 'notes': row.notes, 'source': row.source}
+                                    for row in sorted(section.maintenance_records, key=lambda item: item.maintenance_date, reverse=True)],
+            'images': [{'id': row.id, 'original_name': row.original_name, 'mimetype': row.mimetype,
+                        'captured_at': row.captured_at.isoformat(), 'source': row.source, 'license_name': row.license_name,
+                        'license_url': row.license_url, 'attribution': row.attribution,
+                        'image_url': road_image_url(row)}
+                       for row in sorted(section.images, key=lambda item: item.captured_at, reverse=True)],
+        })
+    return result
+
+
+def road_image_url(image):
+    access = URLSafeTimedSerializer(app.config['JWT_SECRET_KEY'], salt='urbanai-road-image-access').dumps({
+        'section_id': image.road_section_id, 'image_id': image.id,
+    })
+    return f'/api/road-sections/{image.road_section_id}/images/{image.id}?access={access}'
+
+
+def get_road_section_or_404(section_id):
+    return db.session.get(RoadSection, section_id)
+
+
+@app.route('/api/road-sections', methods=['GET'])
+@limiter.limit('120 per minute')
+def list_road_sections():
+    if not road_data_authorized():
+        return jsonify({'success': False, 'error': 'Administrator or department officer access is required.'}), 403
+    try:
+        limit = min(max(int(request.args.get('limit', 200)), 1), 500)
+        offset = max(int(request.args.get('offset', 0)), 0)
+    except ValueError:
+        return jsonify({'success': False, 'error': 'Limit and offset must be whole numbers.'}), 400
+    query = RoadSection.query.order_by(RoadSection.section_code.asc())
+    total = query.count()
+    sections = query.offset(offset).limit(limit).all()
+    return jsonify({'success': True, 'items': [road_section_dict(row) for row in sections], 'total': total})
+
+
+@app.route('/api/road-sections', methods=['POST'])
+@limiter.limit('60 per hour')
+def create_road_section():
+    if not road_data_authorized():
+        return jsonify({'success': False, 'error': 'Administrator or department officer access is required.'}), 403
+    data = request.get_json(silent=True) or {}
+    code = str(data.get('section_code') or '').strip()
+    name = str(data.get('road_name') or '').strip()
+    if not code or len(code) > 64 or not name or len(name) > 200:
+        return jsonify({'success': False, 'error': 'Section ID (1–64 characters) and road name (1–200 characters) are required.'}), 400
+    if RoadSection.query.filter_by(section_code=code).first():
+        return jsonify({'success': False, 'error': 'A road section with this ID already exists.'}), 409
+    try:
+        length = optional_road_number(data.get('length_meters'), 'Length in meters', 0)
+        latitude = optional_road_number(data.get('latitude'), 'Latitude', -90, 90)
+        longitude = optional_road_number(data.get('longitude'), 'Longitude', -180, 180)
+        if (latitude is None) != (longitude is None):
+            raise ValueError('Latitude and longitude must be supplied together.')
+    except ValueError as error:
+        return jsonify({'success': False, 'error': str(error)}), 400
+    user = current_user()
+    section = RoadSection(section_code=code, road_name=name, ward_zone=(data.get('ward_zone') or '').strip()[:120] or None,
+                          road_type=(data.get('road_type') or '').strip()[:80] or None, length_meters=length,
+                          latitude=latitude, longitude=longitude, notes=(data.get('notes') or '').strip()[:2000] or None,
+                          source=(data.get('source') or '').strip()[:255] or None,
+                          created_by=user.id if user else None)
+    db.session.add(section)
+    try:
+        db.session.flush()
+        audit_action(None, 'road_section_created', f'{section.section_code}: {section.road_name}')
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
+    return jsonify({'success': True, 'item': road_section_dict(section)}), 201
+
+
+@app.route('/api/road-sections/import', methods=['POST'])
+@limiter.limit('10 per hour')
+def import_road_sections_csv():
+    if not road_data_authorized():
+        return jsonify({'success': False, 'error': 'Administrator or department officer access is required.'}), 403
+    uploaded = request.files.get('file')
+    if not uploaded or not uploaded.filename.lower().endswith('.csv'):
+        return jsonify({'success': False, 'error': 'Choose a CSV file.'}), 400
+    raw = uploaded.read(2_000_001)
+    if len(raw) > 2_000_000:
+        return jsonify({'success': False, 'error': 'CSV files are limited to 2 MB.'}), 413
+    try:
+        text_data = raw.decode('utf-8-sig')
+        reader = csv.DictReader(text_data.splitlines())
+        required = {'section_code', 'road_name'}
+        if not reader.fieldnames or not required.issubset({name.strip() for name in reader.fieldnames}):
+            raise ValueError('CSV must include section_code and road_name columns.')
+        allowed = {'section_code', 'road_name', 'ward_zone', 'road_type', 'length_meters', 'latitude', 'longitude', 'notes', 'source'}
+        if not set(name.strip() for name in reader.fieldnames).issubset(allowed):
+            raise ValueError('CSV contains unsupported columns.')
+        rows = []
+        seen = set()
+        for row_number, row in enumerate(reader, start=2):
+            if row_number > 5001:
+                raise ValueError('A CSV import can contain at most 5,000 road sections.')
+            normalized = {str(key or '').strip(): (value or '').strip() for key, value in row.items()}
+            code, name = normalized.get('section_code', ''), normalized.get('road_name', '')
+            if not code or len(code) > 64 or not name or len(name) > 200:
+                raise ValueError(f'Row {row_number}: section_code and road_name are required and must fit the documented limits.')
+            if code in seen or RoadSection.query.filter_by(section_code=code).first():
+                raise ValueError(f'Row {row_number}: duplicate section_code {code}.')
+            seen.add(code)
+            length = optional_road_number(normalized.get('length_meters'), f'Row {row_number} length_meters', 0)
+            latitude = optional_road_number(normalized.get('latitude'), f'Row {row_number} latitude', -90, 90)
+            longitude = optional_road_number(normalized.get('longitude'), f'Row {row_number} longitude', -180, 180)
+            if (latitude is None) != (longitude is None):
+                raise ValueError(f'Row {row_number}: latitude and longitude must be supplied together.')
+            rows.append(RoadSection(section_code=code, road_name=name,
+                                    ward_zone=normalized.get('ward_zone', '')[:120] or None,
+                                    road_type=normalized.get('road_type', '')[:80] or None,
+                                    length_meters=length, latitude=latitude, longitude=longitude,
+                                    notes=normalized.get('notes', '')[:2000] or None,
+                                    source=normalized.get('source', '')[:255] or None,
+                                    created_by=current_user().id if current_user() else None))
+        if not rows:
+            raise ValueError('CSV contains no road sections.')
+    except (UnicodeDecodeError, csv.Error, ValueError) as error:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(error)}), 400
+    try:
+        db.session.add_all(rows)
+        db.session.flush()
+        audit_action(None, 'road_sections_csv_imported', f'{len(rows)} sections imported')
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
+    return jsonify({'success': True, 'created': len(rows), 'items': [road_section_dict(row) for row in rows]}), 201
+
+
+@app.route('/api/road-sections/<int:section_id>', methods=['GET', 'PATCH'])
+def road_section_detail(section_id):
+    if not road_data_authorized():
+        return jsonify({'success': False, 'error': 'Administrator or department officer access is required.'}), 403
+    section = get_road_section_or_404(section_id)
+    if not section:
+        return jsonify({'success': False, 'error': 'Road section not found.'}), 404
+    if request.method == 'GET':
+        return jsonify({'success': True, 'item': road_section_dict(section, detail=True)})
+    data = request.get_json(silent=True) or {}
+    allowed = {'road_name', 'ward_zone', 'road_type', 'length_meters', 'latitude', 'longitude', 'notes', 'source'}
+    if set(data) - allowed:
+        return jsonify({'success': False, 'error': 'Unsupported road-section field.'}), 400
+    try:
+        for field, maximum in [('road_name', 200), ('ward_zone', 120), ('road_type', 80), ('notes', 2000), ('source', 255)]:
+            if field in data:
+                value = str(data[field] or '').strip()
+                if field == 'road_name' and not value:
+                    raise ValueError('Road name cannot be empty.')
+                if len(value) > maximum:
+                    raise ValueError(f'{field} exceeds {maximum} characters.')
+                setattr(section, field, value or None)
+        if 'length_meters' in data:
+            section.length_meters = optional_road_number(data['length_meters'], 'Length in meters', 0)
+        if 'latitude' in data:
+            section.latitude = optional_road_number(data['latitude'], 'Latitude', -90, 90)
+        if 'longitude' in data:
+            section.longitude = optional_road_number(data['longitude'], 'Longitude', -180, 180)
+        if (section.latitude is None) != (section.longitude is None):
+            raise ValueError('Latitude and longitude must be supplied together.')
+    except ValueError as error:
+        return jsonify({'success': False, 'error': str(error)}), 400
+    audit_action(None, 'road_section_updated', section.section_code)
+    db.session.commit()
+    return jsonify({'success': True, 'item': road_section_dict(section)})
+
+
+def road_record_context(section_id):
+    if not road_data_authorized():
+        return None, (jsonify({'success': False, 'error': 'Administrator or department officer access is required.'}), 403)
+    section = get_road_section_or_404(section_id)
+    if not section:
+        return None, (jsonify({'success': False, 'error': 'Road section not found.'}), 404)
+    return section, None
+
+
+def road_record_source(data):
+    source = str(data.get('source') or '').strip()
+    if not source or len(source) > 255:
+        raise ValueError('Data source is required and must be at most 255 characters.')
+    return source
+
+
+def road_record_author():
+    user = current_user()
+    return user.id if user else None
+
+
+def commit_road_record(section, action, details):
+    audit_action(None, action, f'{section.section_code}: {details}')
+    db.session.commit()
+
+
+@app.route('/api/road-sections/<int:section_id>/conditions', methods=['POST'])
+def create_road_condition(section_id):
+    section, error = road_record_context(section_id)
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    try:
+        condition = str(data.get('condition') or '').strip()
+        if condition not in ROAD_CONDITIONS:
+            raise ValueError('Choose a supported observed road condition.')
+        severity = optional_road_number(data.get('severity'), 'Severity', 1, 5, integer=True)
+        record = RoadConditionObservation(road_section=section, observed_at=parse_road_datetime(data.get('observed_at'), 'Observation date'),
+                                          condition=condition, severity=severity,
+                                          details=(data.get('details') or '').strip()[:2000] or None,
+                                          source=road_record_source(data), created_by=road_record_author())
+        db.session.add(record)
+        commit_road_record(section, 'road_condition_recorded', condition)
+    except ValueError as error:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(error)}), 400
+    return jsonify({'success': True, 'item': road_section_dict(section, detail=True)['conditions'][0]}), 201
+
+
+@app.route('/api/road-sections/<int:section_id>/inspections', methods=['POST'])
+def create_road_inspection(section_id):
+    section, error = road_record_context(section_id)
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    findings = str(data.get('findings') or '').strip()
+    if not findings or len(findings) > 2000:
+        return jsonify({'success': False, 'error': 'Inspection findings are required and must fit 2,000 characters.'}), 400
+    try:
+        record = RoadInspection(road_section=section, inspected_at=parse_road_datetime(data.get('inspected_at'), 'Inspection date'),
+                                inspector=(data.get('inspector') or '').strip()[:160] or None,
+                                findings=findings, recommended_action=(data.get('recommended_action') or '').strip()[:1000] or None,
+                                source=road_record_source(data), created_by=road_record_author())
+        db.session.add(record)
+        commit_road_record(section, 'road_inspection_recorded', 'inspection recorded')
+    except ValueError as error:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(error)}), 400
+    return jsonify({'success': True, 'item': road_section_dict(section, detail=True)['inspections'][0]}), 201
+
+
+@app.route('/api/road-sections/<int:section_id>/weather', methods=['POST'])
+def create_road_weather_observation(section_id):
+    section, error = road_record_context(section_id)
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    try:
+        rainfall = optional_road_number(data.get('rainfall_mm'), 'Rainfall (mm)', 0)
+        temperature = optional_road_number(data.get('temperature_c'), 'Temperature (°C)', -100, 100)
+        humidity = optional_road_number(data.get('humidity_percent'), 'Humidity (%)', 0, 100)
+        if all(value is None for value in (rainfall, temperature, humidity)):
+            raise ValueError('Enter at least one measured weather value.')
+        record = RoadWeatherObservation(road_section=section, observed_at=parse_road_datetime(data.get('observed_at'), 'Observation date'),
+                                        rainfall_mm=rainfall, temperature_c=temperature, humidity_percent=humidity,
+                                        source=road_record_source(data), created_by=road_record_author())
+        db.session.add(record)
+        commit_road_record(section, 'road_weather_recorded', 'weather observation recorded')
+    except ValueError as error:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(error)}), 400
+    return jsonify({'success': True, 'item': road_section_dict(section, detail=True)['weather_observations'][0]}), 201
+
+
+@app.route('/api/road-sections/<int:section_id>/traffic', methods=['POST'])
+def create_road_traffic_observation(section_id):
+    section, error = road_record_context(section_id)
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    try:
+        interval = optional_road_number(data.get('interval_minutes'), 'Count interval (minutes)', 1, 1440, integer=True)
+        count = optional_road_number(data.get('vehicle_count'), 'Vehicle count', 0, integer=True)
+        daily = optional_road_number(data.get('average_daily_traffic'), 'Average daily traffic', 0, integer=True)
+        heavy = optional_road_number(data.get('heavy_vehicle_proportion'), 'Heavy-vehicle proportion', 0, 1)
+        peak = optional_road_number(data.get('peak_hour_vehicles'), 'Peak-hour vehicles', 0, integer=True)
+        intensity = str(data.get('intensity_category') or '').strip().lower() or None
+        if intensity and intensity not in TRAFFIC_INTENSITIES:
+            raise ValueError('Traffic intensity must be low, moderate, or heavy.')
+        if all(value is None for value in (count, daily, heavy, peak, intensity)):
+            raise ValueError('Enter at least one measured traffic value.')
+        if count is not None and interval is None:
+            raise ValueError('A count interval is required when entering a vehicle count.')
+        record = RoadTrafficObservation(road_section=section, observed_at=parse_road_datetime(data.get('observed_at'), 'Observation date'),
+                                       interval_minutes=interval, vehicle_count=count, average_daily_traffic=daily,
+                                       heavy_vehicle_proportion=heavy, peak_hour_vehicles=peak, intensity_category=intensity,
+                                       source=road_record_source(data), created_by=road_record_author())
+        db.session.add(record)
+        commit_road_record(section, 'road_traffic_recorded', 'traffic observation recorded')
+    except ValueError as error:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(error)}), 400
+    return jsonify({'success': True, 'item': road_section_dict(section, detail=True)['traffic_observations'][0]}), 201
+
+
+@app.route('/api/road-sections/<int:section_id>/maintenance', methods=['POST'])
+def create_road_maintenance_record(section_id):
+    section, error = road_record_context(section_id)
+    if error:
+        return error
+    data = request.get_json(silent=True) or {}
+    repair_type = str(data.get('repair_type') or '').strip()
+    if not repair_type or len(repair_type) > 160:
+        return jsonify({'success': False, 'error': 'Repair type is required and must fit 160 characters.'}), 400
+    try:
+        cost = optional_road_number(data.get('cost'), 'Maintenance cost', 0)
+        record = RoadMaintenanceRecord(road_section=section, maintenance_date=parse_road_datetime(data.get('maintenance_date'), 'Maintenance date'),
+                                       repair_type=repair_type, cost=cost, notes=(data.get('notes') or '').strip()[:2000] or None,
+                                       source=road_record_source(data), created_by=road_record_author())
+        db.session.add(record)
+        commit_road_record(section, 'road_maintenance_recorded', repair_type)
+    except ValueError as error:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(error)}), 400
+    return jsonify({'success': True, 'item': road_section_dict(section, detail=True)['maintenance_records'][0]}), 201
+
+
+@app.route('/api/road-sections/<int:section_id>/images', methods=['POST'])
+@limiter.limit('20 per hour')
+def create_road_image(section_id):
+    section, error = road_record_context(section_id)
+    if error:
+        return error
+    uploaded = request.files.get('image')
+    try:
+        content, mimetype, original_name = validate_image_upload(uploaded)
+        source = road_record_source(request.form)
+    except ValueError as error:
+        return jsonify({'success': False, 'error': str(error)}), 400
+    try:
+        captured_at = parse_road_datetime(request.form.get('captured_at') or datetime.utcnow().isoformat(), 'Capture date')
+    except ValueError as error:
+        return jsonify({'success': False, 'error': str(error)}), 400
+    image = RoadImage(road_section=section, filename=f'{datetime.utcnow().strftime("%Y%m%d%H%M%S%f")}-{original_name}',
+                      original_name=original_name, mimetype=mimetype, content=content, captured_at=captured_at,
+                      source=source, license_name=(request.form.get('license_name') or '').strip()[:160] or None,
+                      license_url=(request.form.get('license_url') or '').strip()[:500] or None,
+                      attribution=(request.form.get('attribution') or '').strip()[:500] or None,
+                      created_by=road_record_author())
+    db.session.add(image)
+    try:
+        db.session.flush()
+        audit_action(None, 'road_image_uploaded', f'{section.section_code}: {source}')
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
+    return jsonify({'success': True, 'item': {'id': image.id, 'original_name': image.original_name,
+                   'captured_at': image.captured_at.isoformat(), 'source': image.source,
+                   'image_url': road_image_url(image)}}), 201
+
+
+@app.route('/api/road-sections/<int:section_id>/images/<int:image_id>', methods=['GET'])
+def get_road_image(section_id, image_id):
+    image = RoadImage.query.filter_by(id=image_id, road_section_id=section_id).first()
+    if not image:
+        return jsonify({'success': False, 'error': 'Road image not found.'}), 404
+    authorized = road_data_authorized()
+    signed_access = request.args.get('access')
+    if signed_access and not authorized:
+        try:
+            claims = URLSafeTimedSerializer(app.config['JWT_SECRET_KEY'], salt='urbanai-road-image-access').loads(signed_access, max_age=900)
+            authorized = claims.get('section_id') == section_id and claims.get('image_id') == image_id
+        except (BadSignature, SignatureExpired, TypeError, ValueError):
+            authorized = False
+    if not authorized:
+        return jsonify({'success': False, 'error': 'Road image access is not authorized.'}), 403
+    return send_file(BytesIO(image.content), mimetype=image.mimetype, download_name=image.original_name)
 
 
 @jwt.token_in_blocklist_loader

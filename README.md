@@ -131,6 +131,20 @@ These checks used isolated test databases and mocked Resend requests; no product
 
 The `/api/stats` route rejects unauthenticated requests and uses SQL count queries instead of loading every complaint into Python memory. Department assignment is triggered by confirmed categories and can be manually overridden; an AI prediction alone never assigns a department.
 
+## Phase 6A — Road-section management and observations
+
+Phase 6A adds a staff-only **Predictive Road Intelligence** workspace for registering road sections and collecting sourced evidence. It stores road-section metadata separately from citizen complaints, plus condition observations, inspection notes, weather readings, traffic measurements, maintenance history, and road images. Existing complaint and image records are not transformed or used as road measurements.
+
+The active database migration is `0003_road_sections`, following the Phase 5 head `0002_ai_classification`. It creates the new tables additively and has a forward-only downgrade so road records are not dropped automatically. Apply it in a backed-up target environment with `flask --app app db upgrade`; the Docker service does not run migrations at startup. The legacy baseline migration uses the current ORM metadata for fresh database setup, so the Phase 6A migration uses `checkfirst` to support both fresh installs and upgrades.
+
+Road data is available to administrators and department officers/managers. Staff can create and edit road-section metadata, import a CSV, record condition and inspection observations, save weather and traffic measurements, enter actual past maintenance records, and upload images with source and optional license/attribution metadata. Worker and citizen roles cannot access the road-data API. Road coordinates are returned only through the authorized staff API. Road image links are signed and expire after 15 minutes.
+
+Phase 6A API routes are `GET/POST /api/road-sections`, `GET/PATCH /api/road-sections/<id>`, `POST /api/road-sections/import`, and record endpoints under `/api/road-sections/<id>/conditions`, `/inspections`, `/weather`, `/traffic`, `/maintenance`, and `/images`. Road-photo reads use `/api/road-sections/<id>/images/<image_id>` with staff authorization or a short-lived signed link. There is no delete route for road sections or observations in this phase, which avoids accidental loss of source records.
+
+Road-section CSV imports require `section_code,road_name`; optional columns are `ward_zone,road_type,length_meters,latitude,longitude,notes,source`. IDs must be unique within the file and database. Imports are limited to 2 MB and 5,000 sections and are all-or-nothing. Latitude and longitude must be supplied together. Length is stored in meters. Weather values use mm, °C, and percent; traffic counts require an interval when a sample vehicle count is provided. Missing values remain null. Every observation requires a timestamp and a source description; section source is optional when it is unknown.
+
+The UI currently reports **Prediction unavailable**. Existing image classification concerns complaint categories; there are no validated future-condition labels or trained deterioration model. This release does not calculate risk scores, estimate deterioration, create sample measurements, or authorize maintenance. Data-source provenance and any dataset licenses must be checked before using uploaded material for future model training. Dataset preparation, model training/evaluation, prediction, prioritization, and road-risk map overlays remain future phases.
+
 No performance benchmark or production PostgreSQL load test was run. The reports API currently returns all authorized reports in one response; use pagination before scaling to large datasets. Uploaded photographs are stored as PostgreSQL BLOBs, so storage, backup size, and transfer costs should be monitored. Rate limiting currently uses process-local memory; use shared Redis before scaling to multiple web instances.
 
 ## Deploy on Render

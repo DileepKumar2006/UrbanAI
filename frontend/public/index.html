@@ -7,6 +7,9 @@
     <meta name="description" content="Nagrik — Your City. Your Voice. Your Nagrik." />
     <link rel="icon" href="%PUBLIC_URL%/nagrik-mark.svg" />
     <title>Nagrik — Your City. Your Voice. Your Nagrik.</title>
+    <script>
+      (function(){try{var mode=localStorage.getItem('nagrik-theme')||'system';var dark=mode==='dark'||(mode==='system'&&window.matchMedia('(prefers-color-scheme: dark)').matches);document.documentElement.dataset.theme=dark?'dark':'light';document.documentElement.dataset.themeMode=mode;}catch(_){document.documentElement.dataset.theme='light';}})();
+    </script>
   </head>
   <body>
     <noscript>You need JavaScript enabled to use Nagrik.</noscript>

@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,6 +59,8 @@ def train(data_root, output_dir, model_version=None, epochs=15, batch_size=32, l
     root = Path(data_root).resolve()
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / 'dataset_manifest.csv'
+    dataset_reference = hashlib.sha256(manifest_path.read_bytes()).hexdigest() if manifest_path.is_file() else None
     slug_to_index = {slug: index for index, slug in enumerate(SLUGS)}
 
     class SplitDataset(Dataset):
@@ -183,6 +186,10 @@ def train(data_root, output_dir, model_version=None, epochs=15, batch_size=32, l
         'state_dict': best_state,
         'categories': list(SLUGS),
         'model_version': version,
+        'architecture': 'MobileNetV3-Small',
+        'trained_at': datetime.now(timezone.utc).isoformat(),
+        'dataset_reference': f'dataset_manifest_sha256:{dataset_reference}' if dataset_reference else None,
+        'supported_categories': [name for name, _slug in CATEGORIES],
         'thresholds_validated': calibration['validated'],
         'confidence_thresholds': {'medium': calibration['medium'], 'high': calibration['high']},
         'evaluation_summary': {key: metrics[key] for key in ('test_accuracy', 'macro_precision', 'macro_recall', 'macro_f1')},

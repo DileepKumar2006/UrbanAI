@@ -32,9 +32,9 @@ describe('UrbanAI dashboard', () => {
     });
     expect(container.textContent).toContain('Sign in');
     expect(container.textContent).toContain('Create account');
-    expect(container.textContent).toContain('Continue as guest');
+    expect(container.textContent).toContain('Explore as a guest');
     expect(container.textContent).not.toContain('City overview');
-    const guest = [...container.querySelectorAll('button')].find(button => button.textContent.includes('Continue as guest'));
+    const guest = [...container.querySelectorAll('button')].find(button => button.textContent.includes('Explore as a guest'));
     await act(async () => guest.click());
     expect(container.textContent).toContain('City overview');
     expect(container.textContent).toContain('Settings');
@@ -72,7 +72,7 @@ describe('UrbanAI dashboard', () => {
       fields[2].value = 'a-long-test-password';
       fields[2].dispatchEvent(new Event('input', { bubbles: true }));
     });
-    const register = [...container.querySelectorAll('button')].find(button => button.textContent.includes('Create citizen account'));
+    const register = [...container.querySelectorAll('button')].find(button => button.textContent.includes('Create account') && button.className.includes('primary-btn'));
     await act(async () => register.click());
     expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining('/api/auth/register'), expect.objectContaining({ method: 'POST' }));
     expect(sessionStorage.getItem('urbanpulse-access-token')).toBe('test-token');

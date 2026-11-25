@@ -16,6 +16,8 @@ import hashlib
 import hmac
 import html
 import json
+import math
+import re
 from getpass import getpass
 from werkzeug.utils import secure_filename
 from io import BytesIO
@@ -27,8 +29,8 @@ from sqlalchemy.orm import selectinload, deferred
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
 from PIL import Image, UnidentifiedImageError
-from ai.categories import COMPLAINT_CATEGORIES, LABELS, LEGACY_WASTE_CATEGORIES, issue_type_for_category, recommended_department
-from ai.inference import ModelUnavailable, classify_image
+from ai.categories import COMPLAINT_CATEGORIES, LABELS, LEGACY_WASTE_CATEGORIES, issue_type_for_category, recommended_department as default_recommended_department
+from ai.inference import ModelUnavailable, classify_image, configured_model_path
 
 dotenv_path = Path(__file__).resolve().parent / '.env'
 load_dotenv(dotenv_path=dotenv_path)
@@ -173,6 +175,113 @@ def audit_action(issue_id, action, details=''):
                             action=action, details=details[:500]))
 
 
+def recommended_department(category):
+    """Use an authorized database override, falling back to the existing mapping."""
+    if category:
+        route = db.session.get(DepartmentRoute, category)
+        if route and route.department_name:
+            return route.department_name
+    return default_recommended_department(category)
+
+
+def record_issue_history(issue, event_type, details='', old_status=None, new_status=None, image_url=None):
+    user = current_user()
+    db.session.add(IssueHistory(
+        issue_id=issue.id,
+        actor_id=user.id if user else None,
+        event_type=event_type[:40],
+        old_status=old_status,
+        new_status=new_status,
+        details=(details or '')[:2000],
+        image_url=image_url,
+    ))
+
+
+def _description_similarity(left, right):
+    stop_words = {'the', 'and', 'for', 'near', 'with', 'from', 'this', 'that', 'road', 'issue', 'problem', 'at'}
+    tokens = lambda value: {word for word in re.findall(r'[\w]+', (value or '').lower()) if len(word) > 2 and word not in stop_words}
+    a, b = tokens(left), tokens(right)
+    return len(a & b) / len(a | b) if a and b else 0.0
+
+
+def _image_dhash(image_bytes):
+    if not image_bytes:
+        return None
+    try:
+        with Image.open(BytesIO(image_bytes)) as source:
+            pixels = list(source.convert('L').resize((9, 8)).getdata())
+        bits = 0
+        for row in range(8):
+            for col in range(8):
+                bits = (bits << 1) | int(pixels[row * 9 + col] > pixels[row * 9 + col + 1])
+        return bits
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
+
+
+def _distance_meters(lat_a, lon_a, lat_b, lon_b):
+    radius = 6371000
+    p1, p2 = math.radians(lat_a), math.radians(lat_b)
+    delta_p = math.radians(lat_b - lat_a)
+    delta_l = math.radians(lon_b - lon_a)
+    haversine = math.sin(delta_p / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(delta_l / 2) ** 2
+    return radius * 2 * math.atan2(math.sqrt(haversine), math.sqrt(max(0, 1 - haversine)))
+
+
+def find_duplicate_candidates(category, description, latitude=None, longitude=None, image_bytes=None, exclude_id=None):
+    """Return cautious, explainable suggestions; never rejects or merges a complaint."""
+    cutoff = datetime.utcnow() - timedelta(days=45)
+    query = Issue.query.filter(Issue.created_at >= cutoff, Issue.status != 'completed')
+    query = query.filter(or_(Issue.confirmed_category == category, Issue.title == category))
+    if exclude_id:
+        query = query.filter(Issue.id != exclude_id)
+    candidates = query.order_by(Issue.created_at.desc()).limit(250).all()
+    incoming_hash = _image_dhash(image_bytes)
+    results = []
+    for existing in candidates:
+        has_geo = bool(latitude is not None and longitude is not None and existing.latitude and existing.longitude
+                       and (existing.latitude != 0 or existing.longitude != 0))
+        distance = _distance_meters(latitude, longitude, existing.latitude, existing.longitude) if has_geo else None
+        if distance is not None and distance > 1500:
+            continue
+        text_score = _description_similarity(description, existing.description)
+        image_score = None
+        if incoming_hash is not None:
+            filename = (existing.image_url or '').removeprefix('/api/uploads/')
+            stored = db.session.get(UploadedImage, filename) if filename else None
+            old_hash = _image_dhash(stored.content if stored else b'')
+            if old_hash is not None:
+                image_score = 1 - ((incoming_hash ^ old_hash).bit_count() / 64)
+        if text_score < 0.18 and (image_score is None or image_score < 0.83):
+            continue
+        signals = [(0.18, 1.0), (0.34, text_score)]
+        reasons = ['same category']
+        if has_geo:
+            signals.append((0.28, max(0.0, 1 - distance / 1500)))
+            reasons.append(f'about {round(distance)} m away')
+        if text_score > 0:
+            reasons.append('similar description')
+        if image_score is not None:
+            signals.append((0.20, image_score))
+            if image_score >= 0.83:
+                reasons.append('visually similar photo')
+        score = sum(weight * value for weight, value in signals) / sum(weight for weight, _ in signals)
+        if score < 0.42:
+            continue
+        results.append({
+            'id': existing.id,
+            'reference': f'UP-{existing.id:04d}',
+            'category': existing.confirmed_category or existing.title,
+            'location': existing.area_name or 'Nearby area',
+            'created_at': existing.created_at.isoformat() if existing.created_at else None,
+            'status': existing.status,
+            'similarity_score': round(score, 3),
+            'match_reasons': reasons,
+            'group_id': existing.group_id,
+        })
+    return sorted(results, key=lambda item: item['similarity_score'], reverse=True)[:5]
+
+
 def image_token(issue, image_url):
     if not image_url or not image_url.startswith('/api/uploads/'):
         return image_url
@@ -210,6 +319,19 @@ def issue_dict_for_request(issue):
     if authorized:
         payload['image_url'] = image_token(issue, issue.image_url)
         payload['completion_image_url'] = image_token(issue, issue.completion_image_url)
+        history_rows = IssueHistory.query.filter_by(issue_id=issue.id).order_by(IssueHistory.created_at, IssueHistory.id).all()
+        payload['history'] = [{
+            'event_type': row.event_type,
+            'old_status': row.old_status,
+            'new_status': row.new_status,
+            'details': row.details,
+            'image_url': image_token(issue, row.image_url) if row.image_url else None,
+            'actor_role': row.actor.role if row.actor else ('Department staff' if row.event_type in {'assigned', 'work_completed', 'status_changed'} else 'System'),
+            'created_at': row.created_at.isoformat() if row.created_at else None,
+        } for row in history_rows]
+        if not payload['history']:
+            payload['history'] = [{'event_type': 'submitted', 'new_status': None, 'details': 'Complaint submitted',
+                                   'actor_role': 'Citizen', 'created_at': issue.created_at.isoformat() if issue.created_at else None}]
     else:
         payload.pop('latitude', None)
         payload.pop('longitude', None)
@@ -225,6 +347,8 @@ def issue_dict_for_request(issue):
         payload.pop('social_media_posted', None)
         payload.pop('social_media_url', None)
         payload.pop('ai_analysis', None)
+        payload.pop('admin_translation', None)
+        payload.pop('history', None)
         payload.pop('image_url', None)
         payload.pop('completion_image_url', None)
         payload['area_name'] = issue.area_name or 'Location withheld'
@@ -258,6 +382,11 @@ class Issue(db.Model):
     title = db.Column(db.String(200), nullable=False)
     confirmed_category = db.Column(db.String(100))
     description = db.Column(db.Text)
+    description_language = db.Column(db.String(12), nullable=False, default='en')
+    admin_translation = db.Column(db.Text)
+    group_id = db.Column(db.Integer, db.ForeignKey('issue_groups.id'), index=True)
+    verification_status = db.Column(db.String(24), nullable=False, default='pending')
+    verified_at = db.Column(db.DateTime)
     
     # Location data
     latitude = db.Column(db.Float, nullable=False)
@@ -310,6 +439,12 @@ class Issue(db.Model):
             'issue_type': self.issue_type,
             'title': self.title,
             'description': self.description,
+            'description_language': self.description_language or 'en',
+            'admin_translation': self.admin_translation,
+            'group_id': self.group_id,
+            'related_report_count': (Issue.query.filter_by(group_id=self.group_id).count() if self.group_id else 1),
+            'verification_status': self.verification_status or 'pending',
+            'verified_at': self.verified_at.isoformat() if self.verified_at else None,
             'category': self.confirmed_category or (self.title if self.issue_type in {'waste', 'civic'} else 'Pothole / Road Damage'),
             'confirmed_category': self.confirmed_category,
             'latitude': self.latitude,
@@ -363,6 +498,35 @@ class IssueUpdate(db.Model):
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     
     updater = db.relationship('User', backref='issue_updates')
+
+
+class IssueGroup(db.Model):
+    __tablename__ = 'issue_groups'
+    id = db.Column(db.Integer, primary_key=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class IssueHistory(db.Model):
+    __tablename__ = 'issue_history'
+    id = db.Column(db.Integer, primary_key=True)
+    issue_id = db.Column(db.Integer, db.ForeignKey('issues.id', ondelete='CASCADE'), nullable=False, index=True)
+    actor_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    event_type = db.Column(db.String(40), nullable=False)
+    old_status = db.Column(db.String(50))
+    new_status = db.Column(db.String(50))
+    details = db.Column(db.String(2000), nullable=False, default='')
+    image_url = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    actor = db.relationship('User')
+
+
+class DepartmentRoute(db.Model):
+    __tablename__ = 'department_routes'
+    category = db.Column(db.String(100), primary_key=True)
+    department_name = db.Column(db.String(120), nullable=False)
+    updated_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class NotificationQueue(db.Model):
@@ -1565,6 +1729,68 @@ def classify_complaint_image():
     token = URLSafeTimedSerializer(app.config['JWT_SECRET_KEY'], salt='urbanai-ai-prediction').dumps(signed_claims)
     return jsonify({'success': True, 'available': True, **signed_claims, 'prediction_token': token}), 200
 
+
+@app.route('/api/ai/model-info', methods=['GET'])
+def ai_model_info():
+    """Expose only verified local model metadata; never invent evaluation results."""
+    model_path = configured_model_path()
+    evaluation_path = Path(__file__).resolve().parent / 'ai' / 'models' / 'evaluation.json'
+    metadata = {'architecture': 'MobileNetV3-Small', 'available': model_path.is_file(),
+                'model_version': None, 'trained_at': None, 'dataset_reference': None,
+                'evaluation': None, 'supported_categories': list(LABELS)}
+    if model_path.is_file():
+        try:
+            import torch
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
+            metadata.update({key: checkpoint.get(key) for key in ('model_version', 'trained_at', 'dataset_reference')})
+            metadata['architecture'] = checkpoint.get('architecture') or 'MobileNetV3-Small'
+            metadata['supported_categories'] = checkpoint.get('supported_categories') or list(LABELS)
+            if checkpoint.get('categories') != list(__import__('ai.categories', fromlist=['SLUGS']).SLUGS):
+                metadata['available'] = False
+                metadata['error'] = 'Installed model category labels are incompatible.'
+        except (ImportError, OSError, RuntimeError, ValueError):
+            metadata['available'] = False
+            metadata['error'] = 'Installed model metadata could not be read.'
+    if evaluation_path.is_file():
+        try:
+            with evaluation_path.open(encoding='utf-8') as handle:
+                measured = json.load(handle)
+            metadata['evaluation'] = (measured if isinstance(measured, dict)
+                                      and measured.get('model_version') == metadata.get('model_version') else None)
+        except (OSError, ValueError):
+            metadata['evaluation'] = None
+    if not metadata['available']:
+        metadata['message'] = 'No trained and validated classifier is installed; reports remain available for manual category selection.'
+    return jsonify({'success': True, 'model': metadata})
+
+
+@app.route('/api/issues/duplicate-candidates', methods=['POST'])
+@limiter.limit('20 per hour')
+def duplicate_candidates_api():
+    data = request.form if request.content_type and request.content_type.startswith('multipart/') else (request.get_json() or {})
+    category = (data.get('category') or data.get('confirmed_category') or '').strip()
+    description = (data.get('description') or '').strip()
+    if category not in COMPLAINT_CATEGORIES or len(description) < 8 or len(description) > 4000:
+        return jsonify({'success': False, 'error': 'Choose a valid category and enter at least 8 description characters.'}), 400
+    try:
+        latitude = float(data.get('latitude')) if data.get('latitude') not in (None, '') else None
+        longitude = float(data.get('longitude')) if data.get('longitude') not in (None, '') else None
+        if (latitude is None) != (longitude is None):
+            raise ValueError
+        if latitude is not None and (not -90 <= latitude <= 90 or not -180 <= longitude <= 180):
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Provide a valid coordinate pair or omit both coordinates.'}), 400
+    image_bytes = None
+    if request.files.get('image'):
+        try:
+            image_bytes, _mime, _name = validate_image_upload(request.files['image'])
+        except ValueError as error:
+            return jsonify({'success': False, 'error': str(error)}), 400
+    matches = find_duplicate_candidates(category, description, latitude, longitude, image_bytes)
+    return jsonify({'success': True, 'items': matches, 'candidate_count': len(matches),
+                    'message': 'These are suggestions only. Your report will still be saved.'})
+
 @app.route('/api/uploads/<path:filename>')
 def uploaded_image(filename):
     safe_filename = secure_filename(filename)
@@ -1640,6 +1866,35 @@ def create_issue():
     if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
         return jsonify({'success': False, 'error': 'GPS coordinates are outside the valid range.'}), 400
 
+    description_language = (data.get('description_language') or 'en').strip().lower()
+    if description_language not in {'en', 'kn', 'ta', 'hi'}:
+        return jsonify({'success': False, 'error': 'Description language must be en, kn, ta, or hi.'}), 400
+    db.session.flush()
+    image_filename = image_url.removeprefix('/api/uploads/') if image_url else ''
+    stored_image = db.session.get(UploadedImage, image_filename) if image_filename else None
+    image_bytes = stored_image.content if stored_image else b''
+    candidate_matches = find_duplicate_candidates(category, description.strip(), latitude, longitude, image_bytes)
+    related_issue = None
+    group_id = None
+    related_id = data.get('related_issue_id')
+    if related_id not in (None, ''):
+        try:
+            related_id = int(related_id)
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'Related report reference is invalid.'}), 400
+        if not any(match['id'] == related_id for match in candidate_matches):
+            return jsonify({'success': False, 'error': 'That report is not a current duplicate suggestion; submit separately or review the suggestions again.'}), 409
+        related_issue = db.session.get(Issue, related_id)
+        if related_issue.group_id:
+            group_id = related_issue.group_id
+        else:
+            group = IssueGroup(created_by=current_user().id if current_user() else None)
+            db.session.add(group)
+            db.session.flush()
+            group_id = group.id
+            related_issue.group_id = group_id
+            record_issue_history(related_issue, 'grouped', 'Linked to a related citizen report')
+
     user = current_user()
     confirmed_category = category
     issue = Issue(
@@ -1647,6 +1902,8 @@ def create_issue():
         title=category,
         confirmed_category=confirmed_category,
         description=description.strip(),
+        description_language=description_language,
+        group_id=group_id,
         latitude=latitude,
         longitude=longitude,
         geotag_address=address,
@@ -1660,12 +1917,18 @@ def create_issue():
     )
     db.session.add(issue)
     db.session.commit()
+    record_issue_history(issue, 'submitted', 'Complaint submitted', new_status=issue.status)
+    for match in candidate_matches:
+        record_issue_history(issue, 'duplicate_suggestion',
+                             f"Suggested UP-{match['id']:04d} ({round(match['similarity_score'] * 100)}%); citizen decision required")
+    if related_issue:
+        record_issue_history(issue, 'grouped', f'Citizen confirmed this may match UP-{related_issue.id:04d}', new_status=issue.status)
+        audit_action(issue.id, 'related_report_linked', f'group_id={group_id}; related_issue_id={related_issue.id}')
     if issue.assigned_department:
         audit_action(issue.id, 'department_auto_assigned', f'{confirmed_category} -> {issue.assigned_department} (citizen-confirmed category)')
+        record_issue_history(issue, 'assigned', f'Automatically routed to {issue.assigned_department}', new_status=issue.status)
         db.session.commit()
-    image_filename = image_url.removeprefix('/api/uploads/') if image_url else ''
-    stored_image = db.session.get(UploadedImage, image_filename) if image_filename else None
-    image_bytes = stored_image.content if stored_image else b''
+    db.session.commit()
     prediction_token = data.get('prediction_token')
     claims = None
     if prediction_token:
@@ -1801,9 +2064,12 @@ def complete_issue(issue_id):
     if not after_image or not isinstance(update_text, str) or not update_text.strip() or len(update_text) > 2000:
         return jsonify({'success': False, 'error': 'After photo and completion details are required.'}), 400
 
+    previous_status = issue.status
     issue.status = 'completed'
     issue.completed_at = datetime.utcnow()
     issue.completion_image_url = after_image
+
+    record_issue_history(issue, 'completed', update_text.strip(), old_status=previous_status, new_status='completed', image_url=after_image)
 
     db.session.add(IssueUpdate(
         issue_id=issue.id,
@@ -1829,6 +2095,7 @@ def update_issue_status(issue_id):
         return jsonify({'success': False, 'error': 'Choose pending or in_progress; completion requires an after photo.'}), 400
     previous_status = issue.status
     issue.status = status
+    record_issue_history(issue, 'status_changed', 'Department updated complaint status', old_status=previous_status, new_status=status)
     audit_action(issue.id, 'status_changed', f'{previous_status} -> {status}')
     db.session.commit()
     if status == 'in_progress' and previous_status != 'in_progress':
@@ -1847,8 +2114,10 @@ def assign_issue(issue_id):
         return jsonify({'success': False, 'error': 'Department name must be 120 characters or fewer.'}), 400
     issue.assigned_department = department
     issue.assigned_at = datetime.utcnow()
+    previous_status = issue.status
     if issue.status in {'new_report', 'pending'}:
         issue.status = 'assigned'
+    record_issue_history(issue, 'assigned', f'Assigned to {department}', old_status=previous_status, new_status=issue.status)
     audit_action(issue.id, 'department_assigned', department)
     db.session.commit()
     department_email = os.getenv('DEPARTMENT_EMAIL', '').strip()
@@ -1861,6 +2130,134 @@ def assign_issue(issue_id):
         # cannot make the complaint itself fail.
         return jsonify({'success': True, 'issue': issue_dict_for_request(issue), 'email_status': 'not_configured'}), 200
     return jsonify({'success': True, 'issue': issue_dict_for_request(issue)}), 200
+
+
+@app.route('/api/issues/<int:issue_id>/verification', methods=['POST'])
+@jwt_required()
+@limiter.limit('10 per hour')
+def verify_issue_resolution(issue_id):
+    user = current_user()
+    issue = Issue.query.get_or_404(issue_id)
+    if not user or user.role != 'citizen' or issue.created_by != user.id:
+        return jsonify({'success': False, 'error': 'Only the citizen who submitted this report can verify its resolution.'}), 403
+    if issue.status != 'completed':
+        return jsonify({'success': False, 'error': 'Resolution can only be verified after work is marked completed.'}), 409
+    value = (request.get_json() or {}).get('verification')
+    if value not in {'resolved', 'still_unresolved'}:
+        return jsonify({'success': False, 'error': 'Choose resolved or still_unresolved.'}), 400
+    note = (request.get_json() or {}).get('note', '')
+    if not isinstance(note, str) or len(note) > 1000:
+        return jsonify({'success': False, 'error': 'Verification note must be 1,000 characters or fewer.'}), 400
+    old = issue.verification_status or 'pending'
+    issue.verification_status = 'confirmed' if value == 'resolved' else 'unresolved'
+    issue.verified_at = datetime.utcnow()
+    detail = note.strip() or ('Citizen confirmed resolution' if value == 'resolved' else 'Citizen reports the issue remains unresolved')
+    record_issue_history(issue, 'citizen_verified' if value == 'resolved' else 'citizen_disputed', detail,
+                         old_status=old, new_status=issue.verification_status)
+    audit_action(issue.id, 'citizen_resolution_feedback', f'{value}: {detail}')
+    db.session.commit()
+    return jsonify({'success': True, 'issue': issue_dict_for_request(issue)})
+
+
+@app.route('/api/issues/<int:issue_id>/translation', methods=['PATCH'])
+@jwt_required()
+def add_issue_translation(issue_id):
+    issue = Issue.query.get_or_404(issue_id)
+    if not can_manage_issue(issue):
+        return jsonify({'success': False, 'error': 'Assigned department or administrator access is required.'}), 403
+    data = request.get_json() or {}
+    translation = data.get('translation')
+    if not isinstance(translation, str) or not translation.strip() or len(translation) > 5000:
+        return jsonify({'success': False, 'error': 'Translation must contain 1 to 5,000 characters.'}), 400
+    issue.admin_translation = translation.strip()
+    record_issue_history(issue, 'translation_added', f'Administrative translation added ({issue.description_language or "en"} to en)')
+    audit_action(issue.id, 'description_translation_added', f'original_language={issue.description_language or "en"}')
+    db.session.commit()
+    return jsonify({'success': True, 'issue': issue_dict_for_request(issue),
+                    'original_description': issue.description, 'translation': issue.admin_translation})
+
+
+@app.route('/api/admin/issues/<int:issue_id>/group', methods=['PATCH'])
+def update_issue_group(issue_id):
+    if not require_admin():
+        return jsonify({'success': False, 'error': 'Administrator authorization required.'}), 403
+    issue = Issue.query.get_or_404(issue_id)
+    related_id = (request.get_json() or {}).get('related_issue_id')
+    previous_group = issue.group_id
+    if related_id in (None, ''):
+        issue.group_id = None
+        details = f'Report removed from group {previous_group}' if previous_group else 'Report already standalone'
+    else:
+        try:
+            related_id = int(related_id)
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'Related report reference is invalid.'}), 400
+        related = Issue.query.get_or_404(related_id)
+        if related.id == issue.id:
+            return jsonify({'success': False, 'error': 'A report cannot be grouped with itself.'}), 400
+        if issue.group_id:
+            group_id = issue.group_id
+        elif related.group_id:
+            group_id = related.group_id
+        else:
+            group = IssueGroup(created_by=current_user().id if current_user() else None)
+            db.session.add(group)
+            db.session.flush()
+            group_id = group.id
+        related.group_id = group_id
+        issue.group_id = group_id
+        details = f'Administrator grouped report with UP-{related.id:04d}'
+    record_issue_history(issue, 'group_changed', details)
+    audit_action(issue.id, 'report_group_changed', details)
+    db.session.commit()
+    return jsonify({'success': True, 'issue': issue_dict_for_request(issue)})
+
+
+@app.route('/api/admin/duplicates/analytics', methods=['GET'])
+def duplicate_analytics():
+    if not require_admin():
+        return jsonify({'success': False, 'error': 'Administrator authorization required.'}), 403
+    grouped = db.session.query(Issue.group_id, func.count(Issue.id).label('reports')).filter(
+        Issue.group_id.isnot(None)).group_by(Issue.group_id).all()
+    possible = IssueHistory.query.filter_by(event_type='duplicate_suggestion').count()
+    categories = db.session.query(Issue.confirmed_category, func.count(Issue.id)).filter(
+        Issue.group_id.isnot(None)).group_by(Issue.confirmed_category).order_by(func.count(Issue.id).desc()).limit(10).all()
+    locations = db.session.query(Issue.area_name, func.count(Issue.id)).filter(
+        Issue.group_id.isnot(None), Issue.area_name.isnot(None), Issue.area_name != '').group_by(
+        Issue.area_name).order_by(func.count(Issue.id).desc()).limit(10).all()
+    return jsonify({'success': True, 'possible_duplicate_matches': possible,
+                    'confirmed_related_reports': sum(row.reports for row in grouped),
+                    'active_issue_groups': len(grouped),
+                    'frequently_grouped_categories': [{'category': row[0], 'reports': row[1]} for row in categories],
+                    'frequently_grouped_locations': [{'location': row[0], 'reports': row[1]} for row in locations],
+                    'largest_groups': sorted([row.reports for row in grouped], reverse=True)[:10]})
+
+
+@app.route('/api/admin/department-routes', methods=['GET', 'PUT'])
+def department_route_settings():
+    if not require_admin():
+        return jsonify({'success': False, 'error': 'Administrator authorization required.'}), 403
+    if request.method == 'GET':
+        custom = {row.category: row.department_name for row in DepartmentRoute.query.all()}
+        from ai.categories import DEPARTMENT_RECOMMENDATIONS
+        return jsonify({'success': True, 'items': [{'category': category,
+            'department': custom.get(category, department), 'custom': category in custom}
+            for category, department in DEPARTMENT_RECOMMENDATIONS.items()]})
+    data = request.get_json() or {}
+    category = data.get('category')
+    department = data.get('department')
+    if category not in COMPLAINT_CATEGORIES or not isinstance(department, str) or not department.strip() or len(department.strip()) > 120:
+        return jsonify({'success': False, 'error': 'Choose a known category and a department name up to 120 characters.'}), 400
+    route = db.session.get(DepartmentRoute, category)
+    if not route:
+        route = DepartmentRoute(category=category, department_name=department.strip())
+        db.session.add(route)
+    else:
+        route.department_name = department.strip()
+    user = current_user()
+    route.updated_by = user.id if user else None
+    db.session.commit()
+    return jsonify({'success': True, 'item': {'category': route.category, 'department': route.department_name, 'custom': True}})
 
 @app.route('/api/email/status', methods=['GET'])
 def email_status():

@@ -84,7 +84,7 @@ export default function IssueMap({authToken='',adminKey='',onOpenComplaint=()=>{
  function loadMore(){setOffset(value=>value+300)}
 
  return <section className="city-map-page">
-  <div className="map-page-heading"><div><span className="eyebrow">CITY OPERATIONS · GIS</span><h1>City complaint map</h1><p>Locations and status from real UrbanAI complaint records.</p></div><div className="map-view-toggle"><button className={view==='map'?'selected':''} onClick={()=>setView('map')}>Map view</button><button className={view==='list'?'selected':''} onClick={()=>setView('list')}>List view</button></div></div>
+  <div className="map-page-heading"><div><span className="eyebrow">CITY OPERATIONS · GIS</span><h1>City complaint map</h1><p>Locations and status from real Nagrik complaint records.</p></div><div className="map-view-toggle"><button className={view==='map'?'selected':''} onClick={()=>setView('map')}>Map view</button><button className={view==='list'?'selected':''} onClick={()=>setView('list')}>List view</button></div></div>
   <form className="map-filter-bar" onSubmit={applyFilters}>
    <label>Search<input name="search" value={filters.search} onChange={updateFilter} placeholder="Category or location" maxLength="120"/></label>
    <label>Category<select name="category" value={filters.category} onChange={updateFilter}><option value="all">All categories</option>{CATEGORIES.map(value=><option key={value}>{value}</option>)}</select></label>

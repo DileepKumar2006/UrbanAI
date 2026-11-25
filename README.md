@@ -10,6 +10,28 @@ Citizens can maintain one platform review each; new and edited reviews enter mod
 
 Apply the additive review schema with `flask --app app db upgrade` from `backend`; migration `0004_website_reviews` follows the road-sections migration and does not remove complaint data. Review endpoints: `GET /api/reviews`, `GET|POST|PUT|DELETE /api/reviews/mine`, `GET /api/admin/reviews`, `PATCH /api/admin/reviews/<id>/moderation`, and `GET /api/public/stats`.
 
+### Civic intelligence, language preferences, themes, and complaint tracking
+
+The current local branch adds an additive migration, `0005_civic_intelligence`, for complaint description language, a separately stored staff translation, related-report groups, citizen resolution verification, timestamped complaint history, and configurable category-to-department overrides. Apply it with `flask --app app db upgrade` from `backend` after backing up the target database and testing a restored copy. The migration preserves existing issue rows; its downgrade is intentionally a no-op to avoid deleting citizen data.
+
+New API operations are:
+
+- `GET /api/ai/model-info`: reports whether a compatible trained model is available and only returns evaluation metadata when it exists.
+- `POST /api/issues/duplicate-candidates`: returns candidate reports for the citizen to review; it does not reject or automatically merge a report.
+- `POST /api/issues/<id>/verification`: lets the report owner record whether completed work resolved the issue.
+- `PATCH /api/issues/<id>/translation`: lets authorized staff save an administrative translation without replacing the citizen's original description.
+- `PATCH /api/admin/issues/<id>/group`: lets an administrator link or separate reports while retaining each report and its history.
+- `GET /api/admin/duplicates/analytics`: returns duplicate/group counts from stored reports.
+- `GET|PUT /api/admin/department-routes`: reads or changes category routing overrides.
+
+Duplicate candidates currently use category, a simple description token-overlap score, photo perceptual hash when available, proximity, and a 45-day unresolved-report window. The score is a heuristic for human review, not a calibrated probability or semantic AI model. A citizen must explicitly choose whether a candidate is the same issue, and each submitted report remains independently stored. Public match results use generalized location and do not reveal citizen identity.
+
+The complaint timeline is based on recorded history events and the original report. It includes submitted, assignment, status, completion, translation, and verification events when those are present; it does not invent missing workflow stages. Department staff can enter an administrative translation manually. No external translation provider is configured, so automatic translation is not provided. The four UI language catalogs and persisted selector currently cover shared navigation, key landing/report/status/preferences and duplicate-match strings; untranslated interface copy falls back to English and this is not yet a complete translation of every screen.
+
+The appearance selector supports Light, Dark, and System modes, persists the choice locally, and follows OS color changes in System mode. The shared CSS includes dark theme tokens and key dashboard components, but this update has not received full manual visual review across every screen and third-party map/chart surface.
+
+AI classification remains unavailable unless compatible trained UrbanAI model weights and verified evaluation metadata are installed. This work does not create model weights, dataset claims, confidence calibration, or performance results. The existing training pipeline now records provenance metadata in newly generated checkpoints; it does not train automatically.
+
 ## Run locally
 
 1. In `backend`, create/activate a Python environment and install `requirements.txt`.
@@ -124,6 +146,14 @@ These checks used isolated test databases and mocked Resend requests; no product
 - Email tests mocked Resend acceptance and signed webhook callbacks; they did not send or verify real email delivery.
 - `npm audit --omit=dev` could not reach the npm registry because DNS resolution failed, so current frontend advisory status was not verified. Do not infer that the dependencies are clear.
 - Docker is not installed in this workspace. The local Windows host also cannot launch Gunicorn because Gunicorn requires Unix `fcntl`; the Flask test client, Python compilation, and frontend build passed, but a Linux container build/startup remains unverified here.
+
+### Civic intelligence verification (local, current branch)
+
+- Backend: 43 tests passed, including the new grouping, ownership, translation, routing override, duplicate candidate, privacy, and missing-model checks.
+- Frontend: 11 tests passed, including preference persistence and existing dashboard, review, map, and road intelligence checks.
+- Frontend production build succeeded.
+- Migration rehearsal: all revisions through `0005_civic_intelligence` applied to a disposable SQLite database; expected tables and issue columns were verified and the temporary database was removed.
+- No production migration, live email delivery, deployment, or manual cross-screen visual inspection was performed.
 
 ### Phase 1–4 readiness checklist
 

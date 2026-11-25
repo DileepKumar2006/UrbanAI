@@ -13,4 +13,4 @@ COPY backend/ ./backend/
 COPY --from=frontend /frontend/build ./frontend/build
 WORKDIR /app/backend
 ENV PYTHONPATH=/app/backend
-CMD ["sh", "-c", "gunicorn app:app --bind 0.0.0.0:${PORT:-10000}"]
+CMD ["sh", "-c", "flask --app app db upgrade && exec gunicorn app:app --bind 0.0.0.0:${PORT:-10000}"]

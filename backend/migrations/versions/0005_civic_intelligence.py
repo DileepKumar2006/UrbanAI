@@ -28,16 +28,20 @@ def upgrade():
     if not inspector.has_table('issues'):
         return
     current = _columns('issues')
-    if 'group_id' not in current:
-        op.add_column('issues', sa.Column('group_id', sa.Integer(), sa.ForeignKey('issue_groups.id'), nullable=True))
-    if 'description_language' not in current:
-        op.add_column('issues', sa.Column('description_language', sa.String(12), nullable=False, server_default='en'))
-    if 'admin_translation' not in current:
-        op.add_column('issues', sa.Column('admin_translation', sa.Text(), nullable=True))
-    if 'verification_status' not in current:
-        op.add_column('issues', sa.Column('verification_status', sa.String(24), nullable=False, server_default='pending'))
-    if 'verified_at' not in current:
-        op.add_column('issues', sa.Column('verified_at', sa.DateTime(), nullable=True))
+    # Batch mode is a no-op ALTER strategy on PostgreSQL and rebuilds the
+    # table safely on SQLite, which cannot ALTER a column to add a foreign key.
+    with op.batch_alter_table('issues') as batch:
+        if 'group_id' not in current:
+            batch.add_column(sa.Column('group_id', sa.Integer(), nullable=True))
+            batch.create_foreign_key('fk_issues_group_id_issue_groups', 'issue_groups', ['group_id'], ['id'])
+        if 'description_language' not in current:
+            batch.add_column(sa.Column('description_language', sa.String(12), nullable=False, server_default='en'))
+        if 'admin_translation' not in current:
+            batch.add_column(sa.Column('admin_translation', sa.Text(), nullable=True))
+        if 'verification_status' not in current:
+            batch.add_column(sa.Column('verification_status', sa.String(24), nullable=False, server_default='pending'))
+        if 'verified_at' not in current:
+            batch.add_column(sa.Column('verified_at', sa.DateTime(), nullable=True))
 
     inspector = sa.inspect(op.get_bind())
     if not inspector.has_table('issue_history'):

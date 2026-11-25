@@ -21,7 +21,8 @@ from werkzeug.utils import secure_filename
 from io import BytesIO
 from pathlib import Path
 from dotenv import load_dotenv
-from sqlalchemy import Index, or_, and_, text, func
+from sqlalchemy import Index, or_, and_, text, func, CheckConstraint
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload, deferred
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -455,6 +456,29 @@ class AuditLog(db.Model):
     action = db.Column(db.String(80), nullable=False)
     details = db.Column(db.Text, nullable=False, default='')
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
+class WebsiteReview(db.Model):
+    """One moderated platform review per citizen, separate from complaint feedback."""
+    __tablename__ = 'website_reviews'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    rating = db.Column(db.Integer, nullable=False)
+    review_text = db.Column(db.String(2000), nullable=False)
+    moderation_status = db.Column(db.String(20), nullable=False, default='pending')
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    moderated_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    moderated_at = db.Column(db.DateTime)
+    author = db.relationship('User', foreign_keys=[user_id], backref=db.backref('website_review', uselist=False))
+    moderator = db.relationship('User', foreign_keys=[moderated_by])
+    __table_args__ = (
+        db.UniqueConstraint('user_id', name='uq_website_reviews_user_id'),
+        CheckConstraint('rating >= 1 AND rating <= 5', name='ck_website_reviews_rating_range'),
+        CheckConstraint("moderation_status IN ('pending', 'published', 'hidden')", name='ck_website_reviews_moderation_status'),
+        Index('ix_website_reviews_status_created', 'moderation_status', 'created_at'),
+    )
+
 
 
 class RoadSection(db.Model):
@@ -1095,22 +1119,22 @@ def build_email_payload(issue, event, recipient):
             })
         images.append(f'<p><b>{html.escape(label_text)}:</b> {html.escape(filename)} is attached to this email.</p>')
 
-    subject = f'UrbanPulse {label}: {report_id} — {location}'
+    subject = f'Nagrik {label}: {report_id} — {location}'
     body = (
-        f'<h2>UrbanPulse — {html.escape(label)}</h2>'
+        f'<h2>Nagrik — {html.escape(label)}</h2>'
         + ''.join(details)
         + ''.join(images)
-        + f'<p><a href="{url}">View complaint in UrbanPulse</a></p>'
+        + f'<p><a href="{url}">View complaint in Nagrik</a></p>'
     )
     text_body = '\n'.join([
-        f'UrbanPulse — {label}', f'Complaint ID: {report_id}', f'Category: {category}',
+        f'Nagrik — {label}', f'Complaint ID: {report_id}', f'Category: {category}',
         f'Location: {location}', f'Description: {issue.description or ""}',
         f'Submitted: {submitted}', f'Status: {status_label}',
         *( [f'Completed: {completed}'] if completed else [] ),
         f'View complaint: {issue_dashboard_url(issue)}',
     ])
     return {
-        'from': os.getenv('RESEND_FROM_EMAIL', 'UrbanPulse <onboarding@resend.dev>'),
+        'from': os.getenv('RESEND_FROM_EMAIL', 'Nagrik <onboarding@resend.dev>'),
         'to': [recipient], 'subject': subject, 'html': body, 'text': text_body,
         'attachments': attachments,
     }
@@ -2003,6 +2027,234 @@ def create_admin():
     db.session.commit()
     print(f'Administrator {username} created.')
 
+def website_review_dict(review, include_moderation=False):
+    result = {
+        'id': review.id,
+        'rating': review.rating,
+        'review_text': review.review_text,
+        'author': review.author.username if include_moderation and review.author else 'Nagrik citizen',
+        'created_at': review.created_at.isoformat() if review.created_at else None,
+        'updated_at': review.updated_at.isoformat() if review.updated_at else None,
+    }
+    if include_moderation:
+        result.update({
+            'user_id': review.user_id,
+            'moderation_status': review.moderation_status,
+            'moderated_at': review.moderated_at.isoformat() if review.moderated_at else None,
+        })
+    return result
+
+
+def website_review_summary():
+    base = WebsiteReview.query.filter_by(moderation_status='published')
+    count, average = db.session.query(func.count(WebsiteReview.id), func.avg(WebsiteReview.rating)).filter(
+        WebsiteReview.moderation_status == 'published'
+    ).one()
+    distribution_rows = db.session.query(WebsiteReview.rating, func.count(WebsiteReview.id)).filter(
+        WebsiteReview.moderation_status == 'published'
+    ).group_by(WebsiteReview.rating).all()
+    distribution = {str(stars): 0 for stars in range(1, 6)}
+    distribution.update({str(stars): total for stars, total in distribution_rows})
+    return {
+        'average_rating': round(float(average), 2) if count else None,
+        'total_reviews': count,
+        'rating_distribution': distribution,
+    }
+
+
+def citizen_review_user():
+    user = current_user()
+    return user if user and user.role == 'citizen' else None
+
+
+def validate_website_review_payload(data):
+    rating = data.get('rating')
+    review_text = data.get('review_text')
+    if isinstance(rating, bool) or not isinstance(rating, int) or not 1 <= rating <= 5:
+        return None, None, 'Rating must be a whole number from 1 to 5.'
+    if not isinstance(review_text, str):
+        return None, None, 'Review text is required.'
+    review_text = review_text.strip()
+    if not review_text or len(review_text) > 2000:
+        return None, None, 'Review must contain between 1 and 2000 characters.'
+    return rating, review_text, None
+
+
+@app.route('/api/reviews', methods=['GET'])
+def list_public_website_reviews():
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+        per_page = min(50, max(1, int(request.args.get('per_page', 8))))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Page and per_page must be whole numbers.'}), 400
+    sort = request.args.get('sort', 'newest')
+    order_columns = {
+        'newest': (WebsiteReview.created_at.desc(), WebsiteReview.id.desc()),
+        'oldest': (WebsiteReview.created_at.asc(), WebsiteReview.id.asc()),
+        'highest': (WebsiteReview.rating.desc(), WebsiteReview.created_at.desc()),
+        'lowest': (WebsiteReview.rating.asc(), WebsiteReview.created_at.desc()),
+    }
+    if sort not in order_columns:
+        return jsonify({'success': False, 'error': 'Sort must be newest, oldest, highest, or lowest.'}), 400
+    query = WebsiteReview.query.join(User, WebsiteReview.user_id == User.id).filter(
+        WebsiteReview.moderation_status == 'published'
+    )
+    rating_value = request.args.get('rating', '').strip()
+    if rating_value:
+        try:
+            rating = int(rating_value)
+        except ValueError:
+            return jsonify({'success': False, 'error': 'Rating filter must be from 1 to 5.'}), 400
+        if rating < 1 or rating > 5:
+            return jsonify({'success': False, 'error': 'Rating filter must be from 1 to 5.'}), 400
+        query = query.filter(WebsiteReview.rating == rating)
+    search = request.args.get('search', '').strip()
+    if len(search) > 100:
+        return jsonify({'success': False, 'error': 'Search text must be at most 100 characters.'}), 400
+    if search:
+        query = query.filter(or_(WebsiteReview.review_text.contains(search, autoescape=True),
+                                 User.username.contains(search, autoescape=True)))
+    pagination = query.order_by(*order_columns[sort]).paginate(page=page, per_page=per_page, error_out=False)
+    return jsonify({
+        'success': True,
+        **website_review_summary(),
+        'items': [website_review_dict(review) for review in pagination.items],
+        'pagination': {'page': pagination.page, 'per_page': pagination.per_page,
+                       'total': pagination.total, 'pages': pagination.pages},
+    })
+
+
+@app.route('/api/reviews/mine', methods=['GET', 'POST', 'PUT', 'DELETE'])
+@jwt_required()
+@limiter.limit('3 per day', methods=['POST'])
+@limiter.limit('10 per hour', methods=['PUT', 'DELETE'])
+def manage_my_website_review():
+    user = citizen_review_user()
+    if not user:
+        return jsonify({'success': False, 'error': 'Only citizen accounts can manage website reviews.'}), 403
+    review = WebsiteReview.query.filter_by(user_id=user.id).first()
+    if request.method == 'GET':
+        return jsonify({'success': True, 'review': website_review_dict(review, include_moderation=True) if review else None})
+    if request.method == 'DELETE':
+        if not review:
+            return jsonify({'success': False, 'error': 'You have no website review to delete.'}), 404
+        audit_action(None, 'website_review_deleted', f'review_id={review.id}')
+        db.session.delete(review)
+        db.session.commit()
+        return jsonify({'success': True, 'review': None})
+
+    data = request.get_json(silent=True) or {}
+    rating, review_text, error_message = validate_website_review_payload(data)
+    if error_message:
+        return jsonify({'success': False, 'error': error_message}), 400
+    if request.method == 'POST':
+        if review:
+            return jsonify({'success': False, 'error': 'You already have a website review. Edit your existing review instead.'}), 409
+        review = WebsiteReview(user_id=user.id, rating=rating, review_text=review_text,
+                               moderation_status='pending')
+        db.session.add(review)
+        action = 'website_review_created'
+    else:
+        if not review:
+            return jsonify({'success': False, 'error': 'Create a website review before editing it.'}), 404
+        review.rating = rating
+        review.review_text = review_text
+        review.updated_at = datetime.utcnow()
+        review.moderation_status = 'pending'
+        review.moderated_by = None
+        review.moderated_at = None
+        action = 'website_review_edited'
+    try:
+        db.session.flush()
+        audit_action(None, action, f'review_id={review.id}')
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': 'You already have a website review. Edit your existing review instead.'}), 409
+    return jsonify({'success': True, 'review': website_review_dict(review, include_moderation=True)}), 201 if request.method == 'POST' else 200
+
+
+@app.route('/api/admin/reviews', methods=['GET'])
+def list_admin_website_reviews():
+    if not require_admin():
+        return jsonify({'success': False, 'error': 'Administrator authorization required.'}), 403
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+        per_page = min(50, max(1, int(request.args.get('per_page', 20))))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Page and per_page must be whole numbers.'}), 400
+    status_filter = request.args.get('status', 'all')
+    if status_filter not in {'all', 'pending', 'published', 'hidden'}:
+        return jsonify({'success': False, 'error': 'Status must be all, pending, published, or hidden.'}), 400
+    query = WebsiteReview.query.join(User, WebsiteReview.user_id == User.id)
+    if status_filter != 'all':
+        query = query.filter(WebsiteReview.moderation_status == status_filter)
+    rating_value = request.args.get('rating', '').strip()
+    if rating_value:
+        try:
+            rating = int(rating_value)
+        except ValueError:
+            return jsonify({'success': False, 'error': 'Rating filter must be from 1 to 5.'}), 400
+        if rating < 1 or rating > 5:
+            return jsonify({'success': False, 'error': 'Rating filter must be from 1 to 5.'}), 400
+        query = query.filter(WebsiteReview.rating == rating)
+    search = request.args.get('search', '').strip()
+    if len(search) > 100:
+        return jsonify({'success': False, 'error': 'Search text must be at most 100 characters.'}), 400
+    if search:
+        query = query.filter(or_(WebsiteReview.review_text.contains(search, autoescape=True),
+                                 User.username.contains(search, autoescape=True)))
+    sort = request.args.get('sort', 'newest')
+    order_columns = {
+        'newest': (WebsiteReview.created_at.desc(), WebsiteReview.id.desc()),
+        'oldest': (WebsiteReview.created_at.asc(), WebsiteReview.id.asc()),
+        'highest': (WebsiteReview.rating.desc(), WebsiteReview.created_at.desc()),
+        'lowest': (WebsiteReview.rating.asc(), WebsiteReview.created_at.desc()),
+    }
+    if sort not in order_columns:
+        return jsonify({'success': False, 'error': 'Sort must be newest, oldest, highest, or lowest.'}), 400
+    pagination = query.order_by(*order_columns[sort]).paginate(
+        page=page, per_page=per_page, error_out=False
+    )
+    return jsonify({'success': True, **website_review_summary(),
+                    'items': [website_review_dict(review, include_moderation=True) for review in pagination.items],
+                    'pagination': {'page': pagination.page, 'per_page': pagination.per_page,
+                                   'total': pagination.total, 'pages': pagination.pages}})
+
+
+@app.route('/api/admin/reviews/<int:review_id>/moderation', methods=['PATCH'])
+def moderate_website_review(review_id):
+    if not require_admin():
+        return jsonify({'success': False, 'error': 'Administrator authorization required.'}), 403
+    review = db.session.get(WebsiteReview, review_id)
+    if not review:
+        return jsonify({'success': False, 'error': 'Website review not found.'}), 404
+    data = request.get_json(silent=True) or {}
+    status = data.get('moderation_status')
+    if status not in {'published', 'hidden'}:
+        return jsonify({'success': False, 'error': 'Moderation status must be published or hidden.'}), 400
+    previous_status = review.moderation_status
+    actor = current_user()
+    review.moderation_status = status
+    review.moderated_by = actor.id if actor else None
+    review.moderated_at = datetime.utcnow()
+    audit_action(None, 'website_review_moderated', f'review_id={review.id}; {previous_status}->{status}')
+    db.session.commit()
+    return jsonify({'success': True, 'review': website_review_dict(review, include_moderation=True),
+                    **website_review_summary()})
+
+
+@app.route('/api/public/stats', methods=['GET'])
+def public_city_stats():
+    return jsonify({
+        'success': True,
+        'total_reports': Issue.query.count(),
+        'in_progress_reports': Issue.query.filter_by(status='in_progress').count(),
+        'completed_reports': Issue.query.filter_by(status='completed').count(),
+        'published_reviews': WebsiteReview.query.filter_by(moderation_status='published').count(),
+    })
+
+
 FRONTEND_BUILD = Path(__file__).resolve().parent.parent / 'frontend' / 'build'
 
 @app.route('/', defaults={'path': ''})
@@ -2011,7 +2263,7 @@ def frontend_app(path):
     if path.startswith('api/'):
         abort(404)
     if not FRONTEND_BUILD.exists():
-        return jsonify({'message': 'UrbanPulse backend is running', 'api_root': '/api/health'})
+        return jsonify({'message': 'Nagrik backend is running', 'api_root': '/api/health'})
     if path and (FRONTEND_BUILD / path).is_file():
         return send_from_directory(FRONTEND_BUILD, path)
     return send_from_directory(FRONTEND_BUILD, 'index.html')

@@ -18,7 +18,7 @@ os.environ.update({
     'DATABASE_URL': 'sqlite://',
     'URBANPULSE_ADMIN_KEY': 'test-admin-key',
     'RESEND_API_KEY': 're_test_key',
-    'RESEND_FROM_EMAIL': 'UrbanPulse <alerts@example.com>',
+    'RESEND_FROM_EMAIL': 'Nagrik <alerts@example.com>',
     'ADMIN_EMAIL': 'dk142252@gmail.com',
     'DEPARTMENT_EMAIL': 'roads@example.com',
     'APP_BASE_URL': 'https://urbanpulse.example',
@@ -80,7 +80,7 @@ class ComplaintEmailWorkflowTest(unittest.TestCase):
         self.assertTrue(all('Idempotency-Key' in call.kwargs['headers'] for call in self.resend.call_args_list))
         payload = self.resend.call_args_list[0].kwargs['json']
         self.assertIn('UP-0001', payload['html'])
-        self.assertIn('View complaint in UrbanPulse', payload['html'])
+        self.assertIn('View complaint in Nagrik', payload['html'])
         self.assertTrue(payload['attachments'][0]['filename'].endswith('-before.jpg'))
 
     def test_assignment_progress_and_completion_share_complaint_and_attach_before_after(self):
@@ -101,7 +101,7 @@ class ComplaintEmailWorkflowTest(unittest.TestCase):
         self.assertEqual(EmailDelivery.query.filter_by(email_type='assigned').count(), 1)
         self.assertEqual(EmailDelivery.query.filter_by(email_type='in_progress').count(), 2)
         self.assertEqual(EmailDelivery.query.filter_by(email_type='completed').count(), 2)
-        completion_call = next(call for call in self.resend.call_args_list if call.kwargs['json']['subject'].startswith('UrbanPulse Work completed'))
+        completion_call = next(call for call in self.resend.call_args_list if call.kwargs['json']['subject'].startswith('Nagrik Work completed'))
         self.assertTrue(any(item['filename'].endswith('-before.jpg') for item in completion_call.kwargs['json']['attachments']))
         self.assertTrue(any(item['filename'].endswith('-after.jpg') for item in completion_call.kwargs['json']['attachments']))
         self.assertIn('Road repair completed successfully.', completion_call.kwargs['json']['html'])

@@ -1,6 +1,14 @@
-# UrbanPulse
+# Nagrik
 
-UrbanPulse is a React and Flask civic issue reporting app. It supports civic image reports, persistent report history, department status updates, before and after completion photos, email notifications through Resend, and optional AI category suggestions. AI suggestions do not override citizen confirmation or manually assigned departments.
+Nagrik is a React and Flask civic issue reporting app. Your City. Your Voice. Your Nagrik. It supports civic image reports, persistent report history, department status updates, before and after completion photos, email notifications through Resend, and optional AI category suggestions. AI suggestions do not override citizen confirmation or manually assigned departments.
+
+
+
+## Nagrik platform reviews
+
+Citizens can maintain one platform review each; new and edited reviews enter moderation. Public statistics and listings include published reviews only and expose no citizen email or account identifier. Administrators can publish or hide reviews from the Reviews page. Complaint-resolution feedback remains separate.
+
+Apply the additive review schema with `flask --app app db upgrade` from `backend`; migration `0004_website_reviews` follows the road-sections migration and does not remove complaint data. Review endpoints: `GET /api/reviews`, `GET|POST|PUT|DELETE /api/reviews/mine`, `GET /api/admin/reviews`, `PATCH /api/admin/reviews/<id>/moderation`, and `GET /api/public/stats`.
 
 ## Run locally
 
@@ -74,14 +82,14 @@ Configure these **backend** environment variables (never put the API key in Reac
 - `RESEND_FROM_EMAIL`: sender using a verified domain in Resend. Resend's `onboarding@resend.dev` sender is for testing only.
 - `ADMIN_EMAIL`: administrator recipient; defaults to `dk142252@gmail.com`.
 - `DEPARTMENT_EMAIL`: municipal department inbox for assignment and complaint updates.
-- `APP_BASE_URL`: public UrbanPulse URL used for complaint and photograph links.
+- `APP_BASE_URL`: public Nagrik URL used for complaint and photograph links.
 - `RESEND_WEBHOOK_SECRET`: signing secret for the Resend webhook (recommended for delivery tracking).
 
 The backend sends new complaint emails to the admin and configured department, assignment email to the department, and Work in Progress/completion emails to both. Registered citizens who own a report are also included for creation, assignment, progress, and completion events; anonymous reports have no owner recipient. Complaint photos and after-repair photos are attached when present, and each message includes the original complaint link. Email failures do not roll back or hide complaints. Each recipient/event is logged in `email_deliveries`; Resend acceptance is recorded as `accepted`, and only a verified `email.delivered` webhook sets `delivered`. Bounces, provider failures, delayed delivery and complaints update that log as well. Administrators can inspect deliveries and retry determinate failures in Settings; retries use a stable Resend idempotency key and are limited to the provider's 24-hour idempotency window.
 
 In Resend, verify the sender domain, create a webhook for `https://YOUR-APP-URL/api/email/webhook`, select `email.sent`, `email.delivered`, `email.delivery_delayed`, `email.failed`, `email.bounced`, and `email.complained`, then save its signing secret as `RESEND_WEBHOOK_SECRET`. Resend documents idempotency keys for duplicate-safe sends and webhooks for delivery events: [Idempotency keys](https://resend.com/changelog/idempotency-keys), [webhooks](https://resend.com/features/webhooks).
 
-After configuring Render environment variables, wait for deployment. Submit a fresh pothole and waste report, assign each to a department, mark one Work in Progress, and complete one with an after photo. Confirm the emails in the recipient inboxes and check for `delivered` rows in UrbanPulse Settings. Without valid Resend credentials, a verified sender and department address, and a webhook secret, live email delivery cannot be claimed.
+After configuring Render environment variables, wait for deployment. Submit a fresh pothole and waste report, assign each to a department, mark one Work in Progress, and complete one with an after photo. Confirm the emails in the recipient inboxes and check for `delivered` rows in Nagrik Settings. Without valid Resend credentials, a verified sender and department address, and a webhook secret, live email delivery cannot be claimed.
 
 ## Data and deployment notes
 
@@ -151,7 +159,7 @@ No performance benchmark or production PostgreSQL load test was run. The reports
 
 In Render, create a Blueprint from `DileepKumar2006/UrbanAI` and select the `master` branch. Render reads the root `render.yaml`, builds the Docker image, and creates the web service and Postgres database. The blueprint uses free plans for a no-cost preview; its database is temporary and expires after 30 days. Choose a paid Postgres plan in Render before using it for durable citizen reports. After the service is live, open the generated `onrender.com` URL and use the generated `URBANPULSE_ADMIN_KEY` from the service environment in the app's Settings page.
 
-The free Render tier is preview-only for this application: free web services can sleep after 15 minutes idle and lose local files on restart/redeploy; free Postgres is 1 GB and expires after 30 days. UrbanPulse stores uploaded images in the database, so plan durable PostgreSQL capacity and backups before collecting real reports. Render currently lists paid web compute starting at $7/month and Postgres starting at $6/month; actual totals depend on service size, database storage, bandwidth, and plan changes. Verify current pricing before choosing a production plan: [Render pricing](https://render.com/pricing) and [free-tier limits](https://render.com/docs/free). No production environment variable, database, Render service, or deployment was changed during Phase 5.
+The free Render tier is preview-only for this application: free web services can sleep after 15 minutes idle and lose local files on restart/redeploy; free Postgres is 1 GB and expires after 30 days. Nagrik stores uploaded images in the database, so plan durable PostgreSQL capacity and backups before collecting real reports. Render currently lists paid web compute starting at $7/month and Postgres starting at $6/month; actual totals depend on service size, database storage, bandwidth, and plan changes. Verify current pricing before choosing a production plan: [Render pricing](https://render.com/pricing) and [free-tier limits](https://render.com/docs/free). No production environment variable, database, Render service, or deployment was changed during Phase 5.
 
 ### Deployment readiness gate
 

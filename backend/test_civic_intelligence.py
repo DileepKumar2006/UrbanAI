@@ -1,5 +1,8 @@
 import os
 import unittest
+from io import BytesIO
+from unittest.mock import patch
+from PIL import Image
 
 import werkzeug
 if not hasattr(werkzeug, '__version__'):
@@ -8,7 +11,7 @@ if not hasattr(werkzeug, '__version__'):
 os.environ.update({'DATABASE_URL': 'sqlite://', 'URBANPULSE_ADMIN_KEY': 'test-admin-key'})
 from app import (DepartmentRoute, Issue, IssueGroup, IssueHistory, User, app,
                  create_access_token, db, find_duplicate_candidates, limiter,
-                 recommended_department)
+                 recommended_department, translate_for_administration)
 
 
 class CivicIntelligenceWorkflowTest(unittest.TestCase):
@@ -114,6 +117,69 @@ class CivicIntelligenceWorkflowTest(unittest.TestCase):
                                    json={'category': 'Pothole / Road Damage', 'department': 'Roads and Infrastructure'})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(recommended_department('Pothole / Road Damage'), 'Roads and Infrastructure')
+
+    def test_configured_department_pool_routes_to_lowest_active_workload(self):
+        first = self.issue(assigned_department='Roads Team A', status='in_progress')
+        self.issue(assigned_department='Roads Team A', status='pending', created_by=self.other.id)
+        self.issue(assigned_department='Roads Team B', status='assigned', created_by=self.other.id)
+        response = self.client.put('/api/admin/department-routes', headers=self.admin_headers,
+            json={'category':'Pothole / Road Damage','department':'Roads Team A; Roads Team B'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(recommended_department('Pothole / Road Damage'), 'Roads Team B')
+        listed = self.client.get('/api/admin/department-routes', headers=self.admin_headers)
+        item = next(row for row in listed.json['items'] if row['category']=='Pothole / Road Damage')
+        self.assertEqual({team['name']:team['active_reports'] for team in item['eligible_departments']},
+                         {'Roads Team A':2,'Roads Team B':1})
+
+    def test_grouping_rejects_mismatched_confirmed_category(self):
+        pothole = self.issue()
+        waste = self.issue(issue_type='waste', title='Garbage Overflow',
+            confirmed_category='Garbage Overflow', description='Waste near bus stop')
+        response = self.client.patch(f'/api/admin/issues/{waste.id}/group', headers=self.admin_headers,
+                                     json={'related_issue_id': pothole.id})
+        self.assertEqual(response.status_code, 409)
+        self.assertIsNone(db.session.get(Issue, waste.id).group_id)
+
+    def test_configured_translation_uses_backend_service_and_preserves_source(self):
+        class Reply:
+            def raise_for_status(self): pass
+            def json(self): return {'translatedText': 'Water is leaking.'}
+        with patch.dict(os.environ, {'TRANSLATION_SERVICE_URL':'https://translation.example.test/translate','TRANSLATION_API_KEY':'server-only-test-key','ADMIN_LANGUAGE':'en'}), patch('app.requests.post', return_value=Reply()) as post:
+            translated = translate_for_administration('நீர் கசிகிறது', 'ta')
+            self.assertEqual(translated, 'Water is leaking.')
+            args, kwargs = post.call_args
+            self.assertEqual(args[0], 'https://translation.example.test/translate')
+            self.assertEqual(kwargs['json']['q'], 'நீர் கசிகிறது')
+            self.assertEqual(kwargs['json']['source'], 'ta')
+            self.assertEqual(kwargs['json']['target'], 'en')
+            self.assertEqual(kwargs['headers']['Authorization'], 'Bearer server-only-test-key')
+
+    def test_opt_in_report_translation_stores_original_and_translation(self):
+        class Reply:
+            def raise_for_status(self): pass
+            def json(self): return {'translatedText': 'Water is leaking.'}
+        image = BytesIO()
+        Image.new('RGB', (16, 16), color=(30, 60, 90)).save(image, format='JPEG')
+        image.seek(0)
+        with patch.dict(os.environ, {'TRANSLATION_SERVICE_URL':'https://translation.example.test/translate','ADMIN_LANGUAGE':'en'}), patch('app.requests.post', return_value=Reply()), patch('app.notify_issue_by_email'):
+            response = self.client.post('/api/issues', data={
+                'issue_type':'civic', 'category':'Water Leakage', 'description':'நீர் கசிகிறது',
+                'description_language':'ta', 'translate_description':'true',
+                'geotag_address':'Ward 12', 'latitude':'12.9716', 'longitude':'77.5946',
+                'image':(image,'leak.jpg'),
+            }, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 201)
+        issue = db.session.get(Issue, response.json['issue']['id'])
+        self.assertEqual(issue.description, 'நீர் கசிகிறது')
+        self.assertEqual(issue.description_language, 'ta')
+        self.assertEqual(issue.admin_translation, 'Water is leaking.')
+        self.assertIn('translation_added', [event.event_type for event in IssueHistory.query.filter_by(issue_id=issue.id).all()])
+
+    def test_translation_is_optional_when_service_is_not_configured(self):
+        os.environ.pop('TRANSLATION_SERVICE_URL', None)
+        with patch('app.requests.post') as post:
+            self.assertIsNone(translate_for_administration('ಕಸ ತುಂಬಿದೆ', 'kn'))
+            post.assert_not_called()
 
     def test_ai_model_status_does_not_claim_missing_weights(self):
         response = self.client.get('/api/ai/model-info')

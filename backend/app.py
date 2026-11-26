@@ -176,11 +176,19 @@ def audit_action(issue_id, action, details=''):
 
 
 def recommended_department(category):
-    """Use an authorized database override, falling back to the existing mapping."""
+    """Route to the least-loaded configured eligible department for a category."""
     if category:
         route = db.session.get(DepartmentRoute, category)
         if route and route.department_name:
-            return route.department_name
+            candidates = list(dict.fromkeys(name.strip() for name in route.department_name.split(';') if name.strip()))
+            if len(candidates) == 1:
+                return candidates[0]
+            if candidates:
+                active = dict(db.session.query(Issue.assigned_department, func.count(Issue.id)).filter(
+                    Issue.assigned_department.in_(candidates),
+                    Issue.status.in_(['new_report', 'pending', 'assigned', 'in_progress'])
+                ).group_by(Issue.assigned_department).all())
+                return min(candidates, key=lambda name: (active.get(name, 0), name.casefold()))
     return default_recommended_department(category)
 
 
@@ -195,6 +203,37 @@ def record_issue_history(issue, event_type, details='', old_status=None, new_sta
         details=(details or '')[:2000],
         image_url=image_url,
     ))
+
+
+def translate_for_administration(text, source_language):
+    """Translate only through an explicitly configured backend service.
+
+    The source description remains the system of record. The configured
+    backend-only service may be LibreTranslate-compatible or the bundled
+    IndicTrans2 adapter; reporting continues if it is absent or unavailable.
+    """
+    source = (source_language or 'en').lower()
+    target = (os.getenv('ADMIN_LANGUAGE', 'en') or 'en').strip().lower()
+    if source not in {'kn', 'ta', 'hi'} or target != 'en':
+        return None
+    endpoint = os.getenv('TRANSLATION_SERVICE_URL', '').strip()
+    if not endpoint or not isinstance(text, str) or not text.strip():
+        return None
+    if not endpoint.startswith(('https://', 'http://')):
+        return None
+    headers = {'Content-Type': 'application/json'}
+    api_key = os.getenv('TRANSLATION_API_KEY', '').strip()
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+    try:
+        response = requests.post(endpoint, headers=headers, json={
+            'q': text[:5000], 'source': source, 'target': target, 'format': 'text',
+        }, timeout=float(os.getenv('TRANSLATION_TIMEOUT_SECONDS', '20')))
+        response.raise_for_status()
+        translated = response.json().get('translatedText')
+        return translated.strip()[:5000] if isinstance(translated, str) and translated.strip() else None
+    except (requests.RequestException, ValueError, AttributeError):
+        return None
 
 
 def _description_similarity(left, right):
@@ -1917,7 +1956,13 @@ def create_issue():
     )
     db.session.add(issue)
     db.session.commit()
+    translate_requested = str(data.get('translate_description', '')).lower() in {'true', '1', 'yes', 'on'}
+    if translate_requested:
+        issue.admin_translation = translate_for_administration(issue.description, issue.description_language)
     record_issue_history(issue, 'submitted', 'Complaint submitted', new_status=issue.status)
+    if issue.admin_translation:
+        record_issue_history(issue, 'translation_added',
+                             f'Configured translation stored ({issue.description_language} to {os.getenv("ADMIN_LANGUAGE", "en")}).')
     for match in candidate_matches:
         record_issue_history(issue, 'duplicate_suggestion',
                              f"Suggested UP-{match['id']:04d} ({round(match['similarity_score'] * 100)}%); citizen decision required")
@@ -1991,6 +2036,7 @@ def correct_issue_category(issue_id):
     if category not in COMPLAINT_CATEGORIES:
         return jsonify({'success': False, 'error': 'Choose a valid complaint category.'}), 400
     previous = issue.confirmed_category
+    previous_status = issue.status
     previous_recommendation = recommended_department(previous)
     issue.confirmed_category = category
     issue.title = category
@@ -2007,6 +2053,8 @@ def correct_issue_category(issue_id):
     if analysis:
         analysis.confirmed_category = category
     audit_action(issue.id, 'category_confirmed', f'{previous or "unset"} -> {category}')
+    record_issue_history(issue, 'category_confirmed', f'{previous or "unset"} -> {category}',
+                         old_status=previous_status, new_status=issue.status)
     db.session.commit()
     return jsonify({'success': True, 'issue': issue_dict_for_request(issue)})
 
@@ -2023,6 +2071,7 @@ def review_issue_classification(issue_id):
     if not analysis:
         return jsonify({'success': False, 'error': 'No AI analysis is recorded for this complaint.'}), 404
     previous = issue.confirmed_category
+    previous_status = issue.status
     previous_recommendation = recommended_department(previous)
     issue.confirmed_category = category
     issue.title = category
@@ -2042,6 +2091,8 @@ def review_issue_classification(issue_id):
     analysis.reviewed_by = current_user().id if current_user() else None
     analysis.reviewed_at = datetime.utcnow()
     audit_action(issue.id, 'ai_classification_reviewed', f'{previous or "unset"} -> {category}; prediction retained: {analysis.predicted_category or "none"}')
+    record_issue_history(issue, 'ai_classification_reviewed', f'Administrator confirmed {category}',
+                         old_status=previous_status, new_status=issue.status)
     db.session.commit()
     return jsonify({'success': True, 'issue': issue_dict_for_request(issue)})
 
@@ -2170,8 +2221,9 @@ def add_issue_translation(issue_id):
     if not isinstance(translation, str) or not translation.strip() or len(translation) > 5000:
         return jsonify({'success': False, 'error': 'Translation must contain 1 to 5,000 characters.'}), 400
     issue.admin_translation = translation.strip()
-    record_issue_history(issue, 'translation_added', f'Administrative translation added ({issue.description_language or "en"} to en)')
-    audit_action(issue.id, 'description_translation_added', f'original_language={issue.description_language or "en"}')
+    target_language = (os.getenv('ADMIN_LANGUAGE', 'en') or 'en').strip().lower()
+    record_issue_history(issue, 'translation_added', f'Administrative translation added ({issue.description_language or "en"} to {target_language})')
+    audit_action(issue.id, 'description_translation_added', f'original_language={issue.description_language or "en"}; target_language={target_language}')
     db.session.commit()
     return jsonify({'success': True, 'issue': issue_dict_for_request(issue),
                     'original_description': issue.description, 'translation': issue.admin_translation})
@@ -2195,6 +2247,9 @@ def update_issue_group(issue_id):
         related = Issue.query.get_or_404(related_id)
         if related.id == issue.id:
             return jsonify({'success': False, 'error': 'A report cannot be grouped with itself.'}), 400
+        if (issue.issue_type != related.issue_type
+                or (issue.confirmed_category or issue.title) != (related.confirmed_category or related.title)):
+            return jsonify({'success': False, 'error': 'Reports must have the same confirmed category before they can be grouped.'}), 409
         if issue.group_id:
             group_id = issue.group_id
         elif related.group_id:
@@ -2240,14 +2295,24 @@ def department_route_settings():
     if request.method == 'GET':
         custom = {row.category: row.department_name for row in DepartmentRoute.query.all()}
         from ai.categories import DEPARTMENT_RECOMMENDATIONS
-        return jsonify({'success': True, 'items': [{'category': category,
-            'department': custom.get(category, department), 'custom': category in custom}
-            for category, department in DEPARTMENT_RECOMMENDATIONS.items()]})
+        active = dict(db.session.query(Issue.assigned_department, func.count(Issue.id)).filter(
+            Issue.assigned_department.isnot(None), Issue.status.in_(['new_report', 'pending', 'assigned', 'in_progress'])
+        ).group_by(Issue.assigned_department).all())
+        items = []
+        for category, default in DEPARTMENT_RECOMMENDATIONS.items():
+            configured = custom.get(category, default)
+            candidates = list(dict.fromkeys(name.strip() for name in configured.split(';') if name.strip()))
+            items.append({'category': category, 'department': configured, 'custom': category in custom,
+                          'eligible_departments': [{'name': name, 'active_reports': active.get(name, 0)} for name in candidates]})
+        return jsonify({'success': True, 'items': items})
     data = request.get_json() or {}
     category = data.get('category')
     department = data.get('department')
-    if category not in COMPLAINT_CATEGORIES or not isinstance(department, str) or not department.strip() or len(department.strip()) > 120:
-        return jsonify({'success': False, 'error': 'Choose a known category and a department name up to 120 characters.'}), 400
+    candidates = ([part.strip() for part in department.split(';') if part.strip()]
+                  if isinstance(department, str) else [])
+    if (category not in COMPLAINT_CATEGORIES or not candidates or len(department.strip()) > 120
+            or any(len(name) > 100 for name in candidates) or len({name.casefold() for name in candidates}) != len(candidates)):
+        return jsonify({'success': False, 'error': 'Choose a known category and one or more unique departments, separated by semicolons (up to 120 characters total).'}), 400
     route = db.session.get(DepartmentRoute, category)
     if not route:
         route = DepartmentRoute(category=category, department_name=department.strip())
@@ -2257,7 +2322,11 @@ def department_route_settings():
     user = current_user()
     route.updated_by = user.id if user else None
     db.session.commit()
-    return jsonify({'success': True, 'item': {'category': route.category, 'department': route.department_name, 'custom': True}})
+    active = dict(db.session.query(Issue.assigned_department, func.count(Issue.id)).filter(
+        Issue.assigned_department.in_(candidates), Issue.status.in_(['new_report', 'pending', 'assigned', 'in_progress'])
+    ).group_by(Issue.assigned_department).all())
+    return jsonify({'success': True, 'item': {'category': route.category, 'department': route.department_name, 'custom': True,
+                    'eligible_departments': [{'name': name, 'active_reports': active.get(name, 0)} for name in candidates]}})
 
 @app.route('/api/email/status', methods=['GET'])
 def email_status():
@@ -2378,6 +2447,7 @@ def escalate_issue(issue_id):
         escalation_type=issue.escalation_status,
     ))
     audit_action(issue.id, 'complaint_escalated', f'Level {issue.escalation_level}')
+    record_issue_history(issue, 'escalated', f'Escalation level {issue.escalation_level}')
     db.session.commit()
     return jsonify({'success': True, 'issue': issue_dict_for_request(issue)})
 

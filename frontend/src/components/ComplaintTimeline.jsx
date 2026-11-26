@@ -1,3 +1,4 @@
+import '../i18n';
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -19,8 +20,8 @@ export default function ComplaintTimeline({ issue, authToken, authUser, canManag
       const response=await fetch(`${API}/api/issues/${issue.id}/verification`,{method:'POST',headers:{Authorization:`Bearer ${authToken}`,'Content-Type':'application/json'},body:JSON.stringify({verification:value,note})});
       const result=await response.json();
       if(!response.ok)throw new Error(result.error||'Could not save your resolution feedback.');
-      onUpdated(result.issue); onToast(value==='resolved'?'Thank you for confirming the repair.':'Your report that the issue remains is recorded.'); setNote('');
-    } catch(error) { onToast(error.message); } finally { setBusy(false); }
+      onUpdated(result.issue); onToast(t(value==='resolved'?'timeline.thanksResolved':'timeline.unresolvedSaved')); setNote('');
+    } catch(error) { onToast(error.message || t('timeline.verificationError')); } finally { setBusy(false); }
   }
 
   async function saveTranslation(event) {
@@ -29,8 +30,8 @@ export default function ComplaintTimeline({ issue, authToken, authUser, canManag
       const response=await fetch(`${API}/api/issues/${issue.id}/translation`,{method:'PATCH',headers:{Authorization:`Bearer ${authToken}`,'Content-Type':'application/json'},body:JSON.stringify({translation})});
       const result=await response.json();
       if(!response.ok)throw new Error(result.error||'Could not save translation.');
-      onUpdated(result.issue); onToast('Administrative translation saved. Original text was preserved.');
-    } catch(error) { onToast(error.message); } finally { setBusy(false); }
+      onUpdated(result.issue); onToast(t('timeline.translationSaved'));
+    } catch(error) { onToast(error.message || t('timeline.translationError')); } finally { setBusy(false); }
   }
 
   return <section className="complaint-timeline" aria-label={t('timeline.title')}>
@@ -38,14 +39,14 @@ export default function ComplaintTimeline({ issue, authToken, authUser, canManag
     <div className="timeline-events">{(issue.history||[]).map((event,index)=><article className="timeline-event" key={`${event.event_type}-${event.created_at}-${index}`}>
       <span className="timeline-marker" aria-hidden="true"/>
       <div className="timeline-event-content"><div className="timeline-event-head"><b>{event.event_type.replaceAll('_',' ')}</b>{event.new_status&&<span className={`status status-${event.new_status}`}>{t(statusKey(event.new_status),{defaultValue:event.new_status.replaceAll('_',' ')})}</span>}</div>
-        <small>{formatDate(event.created_at)} · {event.actor_role||'System'}</small>{event.details&&<p>{event.details}</p>}
-        {event.image_url&&<img className="timeline-evidence" src={event.image_url.startsWith('http')?event.image_url:`${API}${event.image_url}`} alt="Work evidence"/>}
+        <small>{formatDate(event.created_at)} · {event.actor_role||t('timeline.system')}</small>{event.details&&<p>{event.details}</p>}
+        {event.image_url&&<img className="timeline-evidence" src={event.image_url.startsWith('http')?event.image_url:`${API}${event.image_url}`} alt={t('timeline.workEvidence')}/>}
       </div>
     </article>)}</div>
     {issue.description_language&&issue.description_language!=='en'&&<div className="translation-panel"><h4>{t('timeline.original')} · {issue.description_language.toUpperCase()}</h4><p>{issue.description}</p>{issue.admin_translation&&<><h4>{t('timeline.translation')}</h4><p>{issue.admin_translation}</p></>}
-      {canManage&&<form onSubmit={saveTranslation}><label htmlFor="admin-translation">{t('timeline.translation')}</label><textarea id="admin-translation" value={translation} onChange={event=>setTranslation(event.target.value)} maxLength={5000} required/><button className="primary-btn" disabled={busy}>Save translation</button><small>Staff translation is stored separately; the citizen’s original description remains unchanged.</small></form>}
+      {canManage&&<form onSubmit={saveTranslation}><label htmlFor="admin-translation">{t('timeline.translation')}</label><textarea id="admin-translation" value={translation} onChange={event=>setTranslation(event.target.value)} maxLength={5000} required/><button className="primary-btn" disabled={busy}>{t('timeline.saveTranslation')}</button><small>{t('timeline.staffTranslationHelp')}</small></form>}
     </div>}
-    {ownIssue&&issue.status==='completed'&&<div className="verification-panel"><h4>{t('timeline.verify')}</h4><p>Tell the city team whether the completed work resolved this issue. Your response is added to this report’s history.</p><textarea value={note} onChange={event=>setNote(event.target.value)} maxLength={1000} placeholder="Optional note"/>
+    {ownIssue&&issue.status==='completed'&&<div className="verification-panel"><h4>{t('timeline.verify')}</h4><p>{t('timeline.verifyHelp')}</p><textarea value={note} onChange={event=>setNote(event.target.value)} maxLength={1000} placeholder={t('timeline.optionalNote')}/>
       <div className="verification-actions"><button className="primary-btn" disabled={busy} onClick={()=>verify('resolved')}>{t('action.verifyResolved')}</button><button className="secondary-btn" disabled={busy} onClick={()=>verify('still_unresolved')}>{t('action.verifyUnresolved')}</button></div>
       {issue.verification_status&&issue.verification_status!=='pending'&&<small>{t(statusKey(issue.verification_status),{defaultValue:issue.verification_status})} · {formatDate(issue.verified_at)}</small>}
     </div>}

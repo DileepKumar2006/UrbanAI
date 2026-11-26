@@ -22,11 +22,11 @@ New API operations are:
 - `PATCH /api/issues/<id>/translation`: lets authorized staff save an administrative translation without replacing the citizen's original description.
 - `PATCH /api/admin/issues/<id>/group`: lets an administrator link or separate reports while retaining each report and its history.
 - `GET /api/admin/duplicates/analytics`: returns duplicate/group counts from stored reports.
-- `GET|PUT /api/admin/department-routes`: reads or changes category routing overrides.
+- `GET|PUT /api/admin/department-routes`: reads category routes and saves one or more eligible departments for each category. Separate teams with semicolons to assign each new report to the eligible department with the lowest active open-report count.
 
 Duplicate candidates currently use category, a simple description token-overlap score, photo perceptual hash when available, proximity, and a 45-day unresolved-report window. The score is a heuristic for human review, not a calibrated probability or semantic AI model. A citizen must explicitly choose whether a candidate is the same issue, and each submitted report remains independently stored. Public match results use generalized location and do not reveal citizen identity.
 
-The complaint timeline is based on recorded history events and the original report. It includes submitted, assignment, status, completion, translation, and verification events when those are present; it does not invent missing workflow stages. Department staff can enter an administrative translation manually. No external translation provider is configured, so automatic translation is not provided. The four UI language catalogs and persisted selector currently cover shared navigation, key landing/report/status/preferences and duplicate-match strings; untranslated interface copy falls back to English and this is not yet a complete translation of every screen.
+The complaint timeline is based on recorded history events and the original report. It includes submitted, assignment, status, completion, translation, and verification events when those are present; it does not invent missing workflow stages. Department staff can enter an administrative translation manually. Optional automatic translation runs only when the citizen checks the translation consent box and `TRANSLATION_SERVICE_URL` is configured on the backend; the original description remains unchanged if the service is absent or fails. The four UI language catalogs cover navigation, landing, reports, reviews, map, road intelligence, preferences, and civic intelligence, with English fallback for any untranslated copy. This is not a certified translation of municipal or legal content. See [the research and model evaluation record](backend/ai/RESEARCH.md) for the classifier's data requirements and limits.
 
 The appearance selector supports Light, Dark, and System modes, persists the choice locally, and follows OS color changes in System mode. The shared CSS includes dark theme tokens and key dashboard components, but this update has not received full manual visual review across every screen and third-party map/chart surface.
 
@@ -43,11 +43,22 @@ AI classification remains unavailable unless compatible trained UrbanAI model we
 
 The frontend can point to another backend with `REACT_APP_API_URL` before starting or building it. Photo capture uses the browser camera picker where supported; otherwise users can choose a local image. Photo uploads are citizen initiated and do not perform automatic monitoring.
 
+Optional citizen-consented administrative translation uses the following **backend-only** settings; leave the service URL empty to retain the original text and allow staff translation later. The repository includes a private translation adapter at `backend/translation_service/`, now configured for a pinned public IndicTrans2 fine-tune. The earlier Helsinki-NLP model was tested and produced incorrect Kannada and Tamil outputs. The new IndicTrans2 model downloaded in WSL, but its first inference run failed with a CPU/meta tensor device error. Do not enable either checkpoint for real complaints until that runtime issue is fixed and fluent reviewers approve language-specific outputs. The service is not enabled in production.
+
+```text
+ADMIN_LANGUAGE=en
+TRANSLATION_SERVICE_URL=http://127.0.0.1:5001/translate
+TRANSLATION_API_KEY=<shared-private-service-key>
+TRANSLATION_TIMEOUT_SECONDS=45
+```
+
+The endpoint implements the existing LibreTranslate-compatible `q`, `source`, `target`, and `translatedText` contract. Keep its API key on the server and keep the model adapter on a private network. The timeout is configurable and fails open: complaint creation still succeeds and the original description is preserved. See [the translation adapter setup](backend/translation_service/README.md). Model weights download without account access, but local inference has not passed the smoke test and translation is not operationally approved.
+
 ### AI image classification (optional)
 
 The complaint form requests an advisory prediction after a photo is selected. It shows confidence, model version, and review state; the user still selects the confirmed category, and AI downtime never blocks reporting. The backend signs predictions against the image hash, stores predictions separately from the confirmed complaint category, and exposes an administrator review queue. Department routing uses only the citizen-confirmed category, never an unconfirmed AI prediction. The category map in `backend/ai/categories.py` assigns a department on report creation and re-routes it when the confirmed category changes, provided the current assignment still matches the previous category's automatic route. Administrators can manually override the route. This is a static category mapping, not the Phase 2 department registry/workload engine: department CRUD, editable mappings, workload balancing, assignment history, department-specific email routing, and automatic overdue escalation are not implemented.
 
-The current repository contains a MobileNetV3-Small transfer-learning pipeline, but no trained UrbanAI weights or evaluation metrics. Install `backend/requirements-ai.txt` for optional local ML dependencies. Follow [the dataset preparation guide](backend/ai/dataset/README.md), gather reviewed/licensed labeled examples for each of the seven categories, prepare deterministic splits, then train with `python -m ai.train --data artifacts/dataset-splits --output ai/models` from `backend`. Actual evaluation metrics are saved to `backend/ai/models/evaluation.json`; model weights are git-ignored. Do not use supplied reference photos as a training dataset without explicit permission and proper labels.
+The current repository contains a MobileNetV3-Small transfer-learning pipeline, but no reviewed labeled dataset, trained UrbanAI weights, or evaluation metrics. Install `backend/requirements-ai.txt` for optional local ML dependencies. Follow [the dataset preparation guide](backend/ai/dataset/README.md), gather reviewed/licensed labeled examples for each of the seven categories, prepare deterministic splits, then train with `python -m ai.train --data artifacts/dataset-splits --output ai/models` from `backend`. Actual evaluation metrics are saved to `backend/ai/models/evaluation.json`; model weights are git-ignored. The public datasets reviewed so far do not establish complete, permission-checked seven-category coverage; do not use supplied reference photos as training data without explicit permission and labels.
 
 The classification endpoint is `POST /api/ai/classify` with multipart field `image`. Reports are created with `POST /api/issues` and may include the signed `prediction_token`; `PATCH /api/issues/<id>/category` records a report-owner/admin correction; administrators list uncertain analyses at `GET /api/admin/ai-review` and review at `PATCH /api/issues/<id>/ai-review` with `confirmed_category`.
 
@@ -149,8 +160,9 @@ These checks used isolated test databases and mocked Resend requests; no product
 
 ### Civic intelligence verification (local, current branch)
 
-- Backend: 43 tests passed, including the new grouping, ownership, translation, routing override, duplicate candidate, privacy, and missing-model checks.
-- Frontend: 11 tests passed, including preference persistence and existing dashboard, review, map, and road intelligence checks.
+- Backend: 48 tests passed, including report translation consent, workload-balanced department routing, grouping safety, ownership, duplicate candidates, privacy, and missing-model behavior.
+- Private translation adapter: 4 tests passed for API-key enforcement, input validation, response handling, and graceful model failure. The first public checkpoint produced incorrect Kannada and Tamil samples. A newer public IndicTrans2 fine-tune downloaded, but its first inference run hit a CPU/meta tensor device error; no translation quality claim is made. The adapter remains disabled for production.
+- Frontend: 14 tests passed across dashboard, reviews, map privacy and filters, road intelligence, civic intelligence routing, and preference behavior.
 - Frontend production build succeeded.
 - Migration rehearsal: all revisions through `0005_civic_intelligence` applied to a disposable SQLite database; expected tables and issue columns were verified and the temporary database was removed.
 - No production migration, live email delivery, deployment, or manual cross-screen visual inspection was performed.
@@ -160,14 +172,15 @@ These checks used isolated test databases and mocked Resend requests; no product
 | Area | Status | Evidence / remaining work |
 | --- | --- | --- |
 | Phase 1 security and persistence | Implemented and tested; production checks remain | Password hashing, JWT revocation, role/ownership scopes, image validation, audit events, explicit migrations, Postgres configuration, rate limits and email logs exist. Production secrets, backup/restore and provider settings require deployment-owner verification. |
-| Phase 2 department management | Incomplete | Static confirmed-category routing and manual override are integrated. Department registry/CRUD, editable mappings, workload balancing, assignment history, department-specific email recipients and overdue auto-escalation are absent. |
+| Department assignment | Partially implemented | Configurable category routes support multiple eligible teams and least-open-workload assignment. A separate department registry, staffing/service-area capacity, department-specific email directory, and scheduled overdue escalation remain absent. |
 | Phase 3 image classification | Implemented but unavailable without model assets | Inference and review paths handle missing models safely; no trained UrbanAI weights, reviewed dataset, or measured evaluation results are present. |
+| Multilingual administrative translation | Adapter implemented; model inference unresolved | Service tests pass, but local runtime of the newer IndicTrans2 fine-tune failed on a CPU/meta tensor mismatch. No real outputs from that checkpoint have been verified. Keep the production URL unset until runtime and human-reviewed quality checks pass. |
 | Phase 4 interactive map | Implemented and tested | API-backed markers, filters, clustering/density, paging, missing-coordinate handling and public coordinate masking are tested. Tile availability depends on the external provider. |
 | Email notifications | Implemented; live delivery unverified | Resend calls, provider IDs, idempotency, retries and signed webhook events are implemented. Real sender verification, recipients, webhook configuration and inbox verification remain external setup tasks. |
 | Citizen/admin/department workflows | Implemented and tested for covered paths | Citizen registration/ownership, administrator management, department-scoped work, report history and completion are covered. The dashboard's report feed is polled for updates; `NotificationQueue` is not an active notification service. |
 | Escalation | Partially implemented | Authorized manual escalation and audit history exist; no scheduled SLA/overdue escalation job or escalation email event exists. |
 
-The `/api/stats` route rejects unauthenticated requests and uses SQL count queries instead of loading every complaint into Python memory. Department assignment is triggered by confirmed categories and can be manually overridden; an AI prediction alone never assigns a department.
+The `/api/stats` route rejects unauthenticated requests and uses SQL count queries instead of loading every complaint into Python memory. Department assignment uses the citizen-confirmed category. Admins can configure a single department or a semicolon-separated eligible team pool; new reports in a pool are routed to the team with the lowest current count of open reports. The workload counts include active `new_report`, `pending`, `assigned`, and `in_progress` complaints. Assignments remain editable by authorized staff, and an AI prediction alone never assigns a department. The app does not yet maintain a separate department registry, staffing capacity, service-area rules, or automatic SLA/escalation engine.
 
 ## Phase 6A — Road-section management and observations
 

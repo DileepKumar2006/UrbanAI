@@ -14,6 +14,24 @@ describe('Nagrik language and theme preferences', () => {
   });
   afterEach(() => { if (root) act(() => root.unmount()); container.remove(); });
 
+  test('system mode follows operating-system changes and manual mode stays fixed', async () => {
+    const originalMatchMedia=window.matchMedia;
+    let systemDark=false, listener=()=>{};
+    window.matchMedia=()=>({get matches(){return systemDark;},addEventListener:(_name,callback)=>{listener=callback;},removeEventListener:()=>{}});
+    try {
+      await act(async()=>{root=createRoot(container);root.render(<ThemeProvider><PreferenceControls/></ThemeProvider>);});
+      expect(document.documentElement.dataset.theme).toBe('light');
+      await act(async()=>{systemDark=true;listener();});
+      expect(document.documentElement.dataset.theme).toBe('dark');
+      const theme=container.querySelectorAll('select')[1];
+      await act(async()=>{theme.value='light';theme.dispatchEvent(new Event('change',{bubbles:true}));});
+      systemDark=false;
+      await act(async()=>listener());
+      expect(document.documentElement.dataset.theme).toBe('light');
+      expect(document.documentElement.dataset.themeMode).toBe('light');
+    } finally { window.matchMedia=originalMatchMedia; }
+  });
+
   test('persists language and theme selections and applies the selected theme', async () => {
     await act(async () => { root=createRoot(container); root.render(<ThemeProvider><PreferenceControls/></ThemeProvider>); });
     const selects=container.querySelectorAll('select');

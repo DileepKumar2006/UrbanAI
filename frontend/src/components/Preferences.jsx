@@ -22,19 +22,19 @@ export function ThemeProvider({ children }) {
 }
 
 export function PreferenceControls({ compact = false }) {
-  const { i18n } = useTranslation();
+  const { i18n, t } = useTranslation();
   const context = useContext(ThemeContext);
   const theme = context?.theme || 'system';
   const setTheme = context?.setTheme || (() => {});
   const languages = [
     ['en', 'English'], ['kn', 'ಕನ್ನಡ'], ['ta', 'தமிழ்'], ['hi', 'हिन्दी'],
   ];
-  return <div className={`preference-controls${compact ? ' compact' : ''}`} aria-label="Nagrik preferences">
-    <label><span>{compact ? '文' : 'Language'}</span><select aria-label="Language" value={i18n.resolvedLanguage || 'en'} onChange={event => { i18n.changeLanguage(event.target.value); localStorage.setItem('nagrik-language', event.target.value); }}>
+  return <div className={`preference-controls${compact ? ' compact' : ''}`} aria-label={t('preferences.label', {defaultValue:'Nagrik preferences'})}>
+    <label><span>{compact ? '文' : t('language.label')}</span><select aria-label={t('language.label')} value={i18n.resolvedLanguage || 'en'} onChange={event => { i18n.changeLanguage(event.target.value); localStorage.setItem('nagrik-language', event.target.value); }}>
       {languages.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
     </select></label>
-    <label><span>{compact ? '◐' : 'Appearance'}</span><select aria-label="Appearance" value={theme} onChange={event => setTheme(event.target.value)}>
-      <option value="system">🖥 System</option><option value="light">☀ Light</option><option value="dark">☾ Dark</option>
+    <label><span>{compact ? '◐' : t('theme.label')}</span><select aria-label={t('theme.label')} value={theme} onChange={event => setTheme(event.target.value)}>
+      <option value="system">{t('theme.system')}</option><option value="light">{t('theme.light')}</option><option value="dark">{t('theme.dark')}</option>
     </select></label>
   </div>;
 }

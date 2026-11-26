@@ -45,7 +45,7 @@ describe('Nagrik reviews page', () => {
     });
     await act(async () => [...container.querySelectorAll('button')].find(button => button.textContent.includes('Submit review')).click());
     expect(global.fetch).toHaveBeenCalledWith('/api/reviews/mine', expect.objectContaining({ method: 'POST' }));
-    expect(container.textContent).toContain('pending');
+    expect(container.textContent).toContain('Pending');
     expect(container.textContent).toContain(pendingReview.review_text);
     expect(onToast).toHaveBeenCalledWith('Review saved and sent for moderation.');
   });

@@ -1,0 +1,7 @@
+Flask>=3.1,<4
+python-dotenv>=1.0,<2
+torch>=2.5,<3
+transformers==4.57.1
+sentencepiece>=0.2,<1
+indictranstoolkit==1.1.1
+sacremoses>=0.1,<1

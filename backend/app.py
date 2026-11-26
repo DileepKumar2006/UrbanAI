@@ -148,16 +148,16 @@ def can_access_issue(issue, user=None):
         return False
     if user.role == 'admin':
         return True
-    if user.role in {'manager', 'department_officer', 'worker'}:
+    if user.role == 'community_leader':
         return bool(user.department and issue.assigned_department and user.department.casefold() == issue.assigned_department.casefold())
-    return user.role == 'citizen' and issue.created_by == user.id
+    return False
 
 
 def can_manage_issue(issue):
     if require_admin():
         return True
     user = current_user()
-    return bool(user and user.role in {'manager', 'department_officer', 'worker'}
+    return bool(user and user.role == 'community_leader'
                 and user.department and issue.assigned_department
                 and user.department.casefold() == issue.assigned_department.casefold())
 
@@ -166,7 +166,7 @@ def can_manage_any_issue():
     if require_admin():
         return True
     user = current_user()
-    return bool(user and user.role in {'manager', 'department_officer', 'worker'})
+    return bool(user and user.role == 'community_leader')
 
 
 def audit_action(issue_id, action, details=''):
@@ -824,7 +824,7 @@ TRAFFIC_INTENSITIES = {'low', 'moderate', 'heavy'}
 
 def road_data_authorized():
     user = current_user()
-    return require_admin() or bool(user and user.role in {'manager', 'department_officer'} and user.department)
+    return require_admin() or bool(user and user.role == 'community_leader' and user.department)
 
 
 def parse_road_datetime(value, field):
@@ -1520,6 +1520,32 @@ def register_department_user():
                                                'role': user.role, 'department': user.department}}), 201
 
 
+@app.route('/api/auth/register-community-leader', methods=['POST'])
+@limiter.limit('5 per hour')
+def register_community_leader():
+    if not require_admin():
+        return jsonify({'success': False, 'error': 'Only an administrator can create municipal community leader accounts.'}), 403
+    data = request.get_json(silent=True) or {}
+    username = str(data.get('username') or '').strip()
+    email = str(data.get('email') or '').strip().lower()
+    department = str(data.get('department') or '').strip()
+    password = data.get('password')
+    if len(username) < 3 or len(username) > 80 or '@' not in email or len(email) > 120 or not department or len(department) > 50:
+        return jsonify({'success': False, 'error': 'Valid username, email, and municipal department are required.'}), 400
+    if not isinstance(password, str) or len(password) < 12 or len(password) > 256:
+        return jsonify({'success': False, 'error': 'Password must contain 12 to 256 characters.'}), 400
+    if User.query.filter(or_(User.username == username, User.email == email)).first():
+        return jsonify({'success': False, 'error': 'Username or email is already registered.'}), 409
+    user = User(username=username, email=email, password_hash=generate_password_hash(password),
+                role='community_leader', department=department)
+    db.session.add(user)
+    db.session.commit()
+    audit_action(None, 'community_leader_created', f'{department}: {username}')
+    db.session.commit()
+    return jsonify({'success': True, 'user': {'id': user.id, 'username': user.username,
+                                               'role': user.role, 'department': user.department}}), 201
+
+
 @app.route('/api/auth/login', methods=['POST'])
 @limiter.limit('10 per minute')
 def login():
@@ -1576,11 +1602,12 @@ def get_issues():
 
     query = Issue.query
     user = current_user()
-    if not require_admin() and user:
-        if user.role in {'manager', 'department_officer', 'worker'}:
-            query = query.filter(Issue.assigned_department == user.department)
-        elif user.role == 'citizen':
-            query = query.filter(Issue.created_by == user.id)
+    is_admin = require_admin()
+    is_leader = bool(user and user.role == 'community_leader')
+    if not is_admin and not is_leader:
+        return jsonify({'success': False, 'error': 'Only administrators and municipal community leaders can view reports. Citizens can submit complaints.'}), 403
+    if not is_admin and is_leader:
+        query = query.filter(Issue.assigned_department == user.department)
     if issue_type and issue_type != 'all':
         query = query.filter_by(issue_type=issue_type)
     if status and status != 'all':
@@ -1596,14 +1623,12 @@ def get_map_issues():
     """Map-only report feed with public coordinate masking and bounded paging."""
     user = current_user()
     is_admin = require_admin()
+    is_leader = bool(user and user.role == 'community_leader')
+    if not is_admin and not is_leader:
+        return jsonify({'success': False, 'error': 'Only administrators and municipal community leaders can access the operations map.'}), 403
     query = Issue.query
-    if not is_admin and user:
-        if user.role in {'manager', 'department_officer', 'worker'}:
-            query = query.filter(Issue.assigned_department == user.department)
-        elif user.role == 'citizen':
-            query = query.filter(Issue.created_by == user.id)
-        else:
-            query = query.filter(Issue.id == -1)
+    if not is_admin:
+        query = query.filter(Issue.assigned_department == user.department)
     department_scope = query
 
     category = request.args.get('category', '').strip()
@@ -1633,7 +1658,7 @@ def get_map_issues():
         search_fields = [Issue.title.ilike(pattern), Issue.confirmed_category.ilike(pattern), Issue.area_name.ilike(pattern)]
         # Public requests may use private fields to narrow the result only for
         # staff/owner contexts, never to reveal their values.
-        if is_admin or (user and user.role in {'manager', 'department_officer', 'worker', 'citizen'}):
+        if is_admin or (user and user.role == 'community_leader'):
             search_fields.extend([Issue.description.ilike(pattern), Issue.geotag_address.ilike(pattern)])
         query = query.filter(or_(*search_fields))
 
@@ -1717,14 +1742,14 @@ def get_map_issues():
             'is_escalated': bool(issue.escalation_level or issue.escalation_status in {'escalated', 'social_media'}),
         })
     departments = []
-    if is_admin or (user and user.role in {'manager', 'department_officer', 'worker'}):
+    if is_admin or (user and user.role in {'manager', 'department_officer', 'worker', 'community_leader'}):
         departments = [name for (name,) in department_scope.with_entities(Issue.assigned_department).filter(
             Issue.assigned_department.isnot(None), Issue.assigned_department != ''
         ).distinct().order_by(Issue.assigned_department).all()]
     return jsonify({'success': True, 'items': items, 'total': total, 'limit': limit,
                     'offset': offset, 'has_more': has_more,
                     'missing_coordinates': missing_coordinates,
-                    'precise_coordinates': bool(is_admin or (user and user.role in {'citizen', 'manager', 'department_officer', 'worker'})),
+                    'precise_coordinates': bool(is_admin or (user and user.role == 'community_leader')),
                     'departments': departments,
                     'hotspots': [{'latitude': float(row.latitude_cell), 'longitude': float(row.longitude_cell),
                                   'count': row.report_count} for row in hotspot_rows]})
@@ -2030,8 +2055,8 @@ def get_ai_review_queue():
 def correct_issue_category(issue_id):
     issue = Issue.query.get_or_404(issue_id)
     user = current_user()
-    if not (require_admin() or (user and can_access_issue(issue, user) and user.role == 'citizen' and issue.created_by == user.id)):
-        return jsonify({'success': False, 'error': 'Only the report owner or an administrator can confirm its category.'}), 403
+    if not can_manage_any_issue() or not can_manage_issue(issue):
+        return jsonify({'success': False, 'error': 'Only an administrator or the assigned municipal community leader can edit a complaint category.'}), 403
     category = (request.get_json() or {}).get('category')
     if category not in COMPLAINT_CATEGORIES:
         return jsonify({'success': False, 'error': 'Choose a valid complaint category.'}), 400
@@ -2100,10 +2125,10 @@ def review_issue_classification(issue_id):
 @app.route('/api/issues/<int:issue_id>/complete', methods=['POST'])
 def complete_issue(issue_id):
     if not can_manage_any_issue():
-        return jsonify({'success': False, 'error': 'Administrator or department officer authorization required.'}), 403
+        return jsonify({'success': False, 'error': 'Administrator or municipal community leader authorization required.'}), 403
     issue = Issue.query.get_or_404(issue_id)
     if not can_manage_issue(issue):
-        return jsonify({'success': False, 'error': 'Administrator or assigned department authorization required.'}), 403
+        return jsonify({'success': False, 'error': 'Administrator or assigned municipal community leader authorization required.'}), 403
     data = request.form if request.content_type and request.content_type.startswith('multipart/') else (request.get_json() or {})
     if issue.status == 'completed':
         return jsonify({'success': False, 'error': 'This report is already completed.'}), 409
@@ -2137,10 +2162,10 @@ def complete_issue(issue_id):
 @app.route('/api/issues/<int:issue_id>/status', methods=['PATCH'])
 def update_issue_status(issue_id):
     if not can_manage_any_issue():
-        return jsonify({'success': False, 'error': 'Administrator or department officer authorization required.'}), 403
+        return jsonify({'success': False, 'error': 'Administrator or municipal community leader authorization required.'}), 403
     issue = Issue.query.get_or_404(issue_id)
     if not can_manage_issue(issue):
-        return jsonify({'success': False, 'error': 'Administrator or assigned department authorization required.'}), 403
+        return jsonify({'success': False, 'error': 'Administrator or assigned municipal community leader authorization required.'}), 403
     status = (request.get_json() or {}).get('status')
     if status not in {'pending', 'in_progress'}:
         return jsonify({'success': False, 'error': 'Choose pending or in_progress; completion requires an after photo.'}), 400
@@ -2191,8 +2216,7 @@ def verify_issue_resolution(issue_id):
     issue = Issue.query.get_or_404(issue_id)
     if not user or user.role != 'citizen' or issue.created_by != user.id:
         return jsonify({'success': False, 'error': 'Only the citizen who submitted this report can verify its resolution.'}), 403
-    if issue.status != 'completed':
-        return jsonify({'success': False, 'error': 'Resolution can only be verified after work is marked completed.'}), 409
+    return jsonify({'success': False, 'error': 'Citizen accounts can submit complaints only.'}), 403
     value = (request.get_json() or {}).get('verification')
     if value not in {'resolved', 'still_unresolved'}:
         return jsonify({'success': False, 'error': 'Choose resolved or still_unresolved.'}), 400
@@ -2215,7 +2239,7 @@ def verify_issue_resolution(issue_id):
 def add_issue_translation(issue_id):
     issue = Issue.query.get_or_404(issue_id)
     if not can_manage_issue(issue):
-        return jsonify({'success': False, 'error': 'Assigned department or administrator access is required.'}), 403
+        return jsonify({'success': False, 'error': 'Assigned municipal community leader or administrator access is required.'}), 403
     data = request.get_json() or {}
     translation = data.get('translation')
     if not isinstance(translation, str) or not translation.strip() or len(translation) > 5000:
@@ -2432,10 +2456,10 @@ def resend_webhook():
 @app.route('/api/issues/<int:issue_id>/escalate', methods=['POST'])
 def escalate_issue(issue_id):
     if not can_manage_any_issue():
-        return jsonify({'success': False, 'error': 'Administrator or department officer authorization required.'}), 403
+        return jsonify({'success': False, 'error': 'Administrator or municipal community leader authorization required.'}), 403
     issue = Issue.query.get_or_404(issue_id)
     if not can_manage_issue(issue):
-        return jsonify({'success': False, 'error': 'Administrator or assigned department authorization required.'}), 403
+        return jsonify({'success': False, 'error': 'Administrator or assigned municipal community leader authorization required.'}), 403
     issue.escalation_level = min(issue.escalation_level + 1, 5)
     issue.escalation_status = 'escalated'
     issue.escalation_date = datetime.utcnow()
